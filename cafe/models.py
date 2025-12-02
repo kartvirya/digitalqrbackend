@@ -7,36 +7,188 @@ from django.core.files import File
 from django.core.files.base import ContentFile
 from PIL import Image
 import uuid
+import json
 # Create your models here.
 
 
-class User(AbstractUser):
-
-    email = None
-    username = None
-    phone = models.CharField(max_length=10, unique=True)
-    phone_verified = models.BooleanField(default=False)
-    cafe_manager = models.BooleanField(default=False)
-    order_count = models.IntegerField(default=0)
-
-    objects = UserManager()
-
-    USERNAME_FIELD = 'phone'
-    REQUIRED_FIELDS = []
-
-
-class Floor(models.Model):
+class Restaurant(models.Model):
+    """Restaurant/Hotel tenant model for multi-tenancy"""
+    SUBSCRIPTION_STATUS_CHOICES = [
+        ('active', 'Active'),
+        ('trial', 'Trial'),
+        ('suspended', 'Suspended'),
+        ('cancelled', 'Cancelled'),
+    ]
+    
     id = models.AutoField(primary_key=True)
-    name = models.CharField(max_length=50, unique=True)
-    description = models.TextField(blank=True, null=True)
+    name = models.CharField(max_length=200)
+    slug = models.SlugField(max_length=100, unique=True, help_text="Unique identifier for URLs")
+    address = models.TextField(blank=True, null=True)
+    phone = models.CharField(max_length=20, blank=True, null=True)
+    email = models.EmailField(blank=True, null=True)
     is_active = models.BooleanField(default=True)
+    subscription_status = models.CharField(max_length=20, choices=SUBSCRIPTION_STATUS_CHOICES, default='active')
+    settings = models.JSONField(default=dict, blank=True, help_text="Restaurant-specific configuration")
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
     
     def __str__(self):
         return self.name
     
     class Meta:
         ordering = ['name']
+        verbose_name = 'Restaurant'
+        verbose_name_plural = 'Restaurants'
+
+
+class User(AbstractUser):
+    ROLE_CHOICES = [
+        ('super_admin', 'Super Admin'),
+        ('restaurant_admin', 'Restaurant Admin'),
+        ('hr_manager', 'HR Manager'),
+        ('staff', 'Staff'),
+        ('customer', 'Customer'),
+    ]
+
+    email = None
+    username = None
+    phone = models.CharField(max_length=10, unique=True)
+    phone_verified = models.BooleanField(default=False)
+    cafe_manager = models.BooleanField(default=False)  # Legacy field, kept for backward compatibility
+    order_count = models.IntegerField(default=0)
+    is_super_admin = models.BooleanField(default=False, help_text="Super admin can manage all restaurants")
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.SET_NULL, null=True, blank=True, related_name='admins', help_text="Restaurant this user manages (for restaurant admins)")
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='customer', help_text="User role in the system")
+
+    objects = UserManager()
+
+    USERNAME_FIELD = 'phone'
+    REQUIRED_FIELDS = []
+    
+    def __str__(self):
+        if self.is_super_admin:
+            return f"Super Admin: {self.phone}"
+        elif self.restaurant:
+            return f"{self.restaurant.name} Admin: {self.phone}"
+        return f"User: {self.phone}"
+    
+    def is_restaurant_admin(self):
+        """Check if user is a restaurant admin"""
+        return self.role == 'restaurant_admin' or self.cafe_manager or (self.restaurant and self.role in ['restaurant_admin', 'super_admin'])
+    
+    def is_hr_manager(self):
+        """Check if user is an HR manager"""
+        return self.role == 'hr_manager' or (self.is_restaurant_admin() and self.role == 'hr_manager')
+    
+    def is_staff_member(self):
+        """Check if user is a staff member"""
+        return self.role == 'staff' or hasattr(self, 'employee_profile')
+    
+    def has_permission(self, permission_name):
+        """Check if user has a specific permission"""
+        # Super admin has all permissions
+        if self.is_super_admin or self.role == 'super_admin':
+            return True
+        
+        # Restaurant admin has all restaurant permissions
+        if self.is_restaurant_admin():
+            restaurant_permissions = [
+                'manage_menu', 'manage_tables', 'manage_rooms', 'manage_floors',
+                'manage_orders', 'manage_staff', 'manage_employees', 'manage_payroll',
+                'manage_attendance', 'manage_leaves', 'manage_training', 'manage_performance'
+            ]
+            if permission_name in restaurant_permissions:
+                return True
+        
+        # HR Manager has HR permissions
+        if self.is_hr_manager():
+            hr_permissions = [
+                'manage_employees', 'manage_payroll', 'manage_attendance',
+                'manage_leaves', 'manage_training', 'manage_performance'
+            ]
+            if permission_name in hr_permissions:
+                return True
+        
+        # Staff has operations permissions
+        if self.is_staff_member():
+            staff_permissions = ['manage_orders', 'view_tables', 'view_kitchen']
+            if permission_name in staff_permissions:
+                return True
+        
+        return False
+
+
+class Permission(models.Model):
+    """System permissions for role-based access control"""
+    PERMISSION_CATEGORIES = [
+        ('restaurant', 'Restaurant Management'),
+        ('menu', 'Menu Management'),
+        ('tables', 'Table/Room Management'),
+        ('orders', 'Order Management'),
+        ('employees', 'Employee Management'),
+        ('payroll', 'Payroll Management'),
+        ('attendance', 'Attendance Management'),
+        ('leaves', 'Leave Management'),
+        ('training', 'Training Management'),
+        ('performance', 'Performance Management'),
+        ('hr', 'HR Management'),
+    ]
+    
+    name = models.CharField(max_length=100, unique=True)
+    codename = models.CharField(max_length=100, unique=True)
+    description = models.TextField(blank=True)
+    category = models.CharField(max_length=20, choices=PERMISSION_CATEGORIES)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['category', 'name']
+        verbose_name = 'Permission'
+        verbose_name_plural = 'Permissions'
+    
+    def __str__(self):
+        return f"{self.name} ({self.codename})"
+
+
+class RolePermission(models.Model):
+    """Many-to-many relationship between roles and permissions"""
+    ROLE_CHOICES = [
+        ('super_admin', 'Super Admin'),
+        ('restaurant_admin', 'Restaurant Admin'),
+        ('hr_manager', 'HR Manager'),
+        ('staff', 'Staff'),
+        ('customer', 'Customer'),
+    ]
+    
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES)
+    permission = models.ForeignKey(Permission, on_delete=models.CASCADE, related_name='role_permissions')
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        unique_together = [['role', 'permission']]
+        ordering = ['role', 'permission']
+        verbose_name = 'Role Permission'
+        verbose_name_plural = 'Role Permissions'
+    
+    def __str__(self):
+        return f"{self.get_role_display()} - {self.permission.name}"
+
+
+class Floor(models.Model):
+    id = models.AutoField(primary_key=True)
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='floors', null=True, blank=True)
+    name = models.CharField(max_length=50)
+    description = models.TextField(blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    def __str__(self):
+        if self.restaurant:
+            return f"{self.restaurant.name} - {self.name}"
+        return self.name
+    
+    class Meta:
+        ordering = ['restaurant', 'name']
+        unique_together = [['restaurant', 'name']]
 
 
 class Table(models.Model):
@@ -46,7 +198,8 @@ class Table(models.Model):
     ]
     
     id = models.AutoField(primary_key=True)
-    table_number = models.CharField(max_length=10, unique=True)
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='tables', null=True, blank=True)
+    table_number = models.CharField(max_length=10)
     table_name = models.CharField(max_length=50, blank=True, null=True)
     capacity = models.IntegerField(default=4)
     is_active = models.BooleanField(default=True)
@@ -68,6 +221,9 @@ class Table(models.Model):
     floor = models.ForeignKey(Floor, on_delete=models.CASCADE, related_name='tables', null=True, blank=True)
     room = models.ForeignKey('Room', on_delete=models.CASCADE, related_name='tables', null=True, blank=True)
     
+    class Meta:
+        unique_together = [['restaurant', 'table_number']]
+    
     def __str__(self):
         return f"Table {self.table_number} - {self.table_name or 'Table'}"
     
@@ -75,26 +231,52 @@ class Table(models.Model):
         if not self.qr_unique_id:
             self.qr_unique_id = str(uuid.uuid4())
         super().save(*args, **kwargs)
-        if not self.qr_code:
+        # Only generate QR code if restaurant is set
+        if self.restaurant and not self.qr_code:
             self.generate_qr_code()
     
     def generate_qr_code(self):
-        # Generate QR code with table-specific URL
+        # Generate QR code with table-specific URL including restaurant slug
+        if not self.restaurant:
+            # If no restaurant, use default URL format (for backward compatibility)
+            from django.conf import settings
+            url = f"{settings.FRONTEND_URL}/?table={self.qr_unique_id}"
+        else:
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=10,
+                border=4,
+            )
+            # URL for table-specific ordering - using restaurant slug
+            from django.conf import settings
+            url = f"{settings.FRONTEND_URL}/r/{self.restaurant.slug}/?table={self.qr_unique_id}"
+            qr.add_data(url)
+            qr.make(fit=True)
+            
+            img = qr.make_image(fill_color="black", back_color="white")
+            
+            # Save the QR code image
+            buffer = BytesIO()
+            img.save(buffer, format='PNG')
+            filename = f"table_{self.restaurant.slug}_{self.table_number}_qr.png"
+            
+            self.qr_code.save(filename, ContentFile(buffer.getvalue()), save=False)
+            self.save(update_fields=['qr_code'])
+            return
+        
+        # Fallback for no restaurant
         qr = qrcode.QRCode(
             version=1,
             error_correction=qrcode.constants.ERROR_CORRECT_L,
             box_size=10,
             border=4,
         )
-        # URL for table-specific ordering - using network IP
-        from django.conf import settings
-        url = f"{settings.FRONTEND_URL}/?table={self.qr_unique_id}"
         qr.add_data(url)
         qr.make(fit=True)
         
         img = qr.make_image(fill_color="black", back_color="white")
         
-        # Save the QR code image
         buffer = BytesIO()
         img.save(buffer, format='PNG')
         filename = f"table_{self.table_number}_qr.png"
@@ -122,7 +304,8 @@ class Room(models.Model):
     ]
     
     id = models.AutoField(primary_key=True)
-    room_number = models.CharField(max_length=10, unique=True)
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='rooms', null=True, blank=True)
+    room_number = models.CharField(max_length=10)
     room_name = models.CharField(max_length=100, blank=True, null=True)
     room_type = models.CharField(max_length=20, choices=ROOM_TYPE_CHOICES, default='single')
     floor = models.ForeignKey(Floor, on_delete=models.CASCADE, related_name='rooms')
@@ -137,8 +320,13 @@ class Room(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
+    class Meta:
+        unique_together = [['restaurant', 'room_number']]
+        ordering = ['restaurant', 'floor', 'room_number']
+    
     def __str__(self):
-        return f"Room {self.room_number} - {self.get_room_type_display()}"
+        restaurant_name = self.restaurant.name if self.restaurant else 'No Restaurant'
+        return f"{restaurant_name} - Room {self.room_number} - {self.get_room_type_display()}"
     
     def save(self, *args, **kwargs):
         if not self.qr_unique_id:
@@ -148,22 +336,47 @@ class Room(models.Model):
             self.generate_qr_code()
     
     def generate_qr_code(self):
-        # Generate QR code with room-specific URL
+        # Generate QR code with room-specific URL including restaurant slug
+        if not self.restaurant:
+            # If no restaurant, use default URL format (for backward compatibility)
+            from django.conf import settings
+            url = f"{settings.FRONTEND_URL}/?room={self.qr_unique_id}"
+        else:
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=10,
+                border=4,
+            )
+            # URL for room-specific ordering - using restaurant slug
+            from django.conf import settings
+            url = f"{settings.FRONTEND_URL}/r/{self.restaurant.slug}/?room={self.qr_unique_id}"
+            qr.add_data(url)
+            qr.make(fit=True)
+            
+            img = qr.make_image(fill_color="black", back_color="white")
+            
+            # Save the QR code image
+            buffer = BytesIO()
+            img.save(buffer, format='PNG')
+            filename = f"room_{self.restaurant.slug}_{self.room_number}_qr.png"
+            
+            self.qr_code.save(filename, ContentFile(buffer.getvalue()), save=False)
+            self.save(update_fields=['qr_code'])
+            return
+        
+        # Fallback for no restaurant
         qr = qrcode.QRCode(
             version=1,
             error_correction=qrcode.constants.ERROR_CORRECT_L,
             box_size=10,
             border=4,
         )
-        # URL for room-specific ordering - using network IP
-        from django.conf import settings
-        url = f"{settings.FRONTEND_URL}/?room={self.qr_unique_id}"
         qr.add_data(url)
         qr.make(fit=True)
         
         img = qr.make_image(fill_color="black", back_color="white")
         
-        # Save the QR code image
         buffer = BytesIO()
         img.save(buffer, format='PNG')
         filename = f"room_{self.room_number}_qr.png"
@@ -177,18 +390,21 @@ class Room(models.Model):
 
 class menu_item(models.Model):
     id = models.AutoField(primary_key=True)
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='menu_items', null=True, blank=True)
     name = models.CharField(max_length=50)
     category = models.CharField(max_length=50)
     description = models.CharField(max_length=250)
     image = models.ImageField(upload_to='fimage', blank=True, null=True)
-    price = models.CharField(max_length=4, default='0')
-    list_order = models.IntegerField()
+    price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    list_order = models.IntegerField(default=0)
     is_available = models.BooleanField(default=True)
     
     class Meta:
-        ordering = ['category', 'name']
+        ordering = ['restaurant', 'category', 'name']
     
     def __str__(self):
+        if self.restaurant:
+            return f"{self.restaurant.name} - {self.name}"
         return self.name
 
 
@@ -203,16 +419,41 @@ class rating(models.Model):
 
 
 class order(models.Model):
+    PAYMENT_STATUS_CHOICES = [
+        ('unpaid', 'Unpaid'),
+        ('pending_payment', 'Pending Payment'),
+        ('paid', 'Paid'),
+        ('failed', 'Failed'),
+        ('refunded', 'Refunded'),
+    ]
+
+    PAYMENT_METHOD_CHOICES = [
+        ('unknown', 'Unknown'),
+        ('cash', 'Cash'),
+        ('card', 'Card'),
+        ('upi', 'UPI'),
+        ('online_gateway', 'Online Gateway'),
+    ]
+
     id = models.AutoField(primary_key=True)
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='orders', null=True, blank=True)
     items_json = models.CharField(max_length=5000)
     name = models.CharField(max_length=30)
     phone = models.CharField(max_length=10)
     table = models.CharField(max_length=15)
-    price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    bill_clear = models.BooleanField()
+    # Monetary fields
+    price = models.DecimalField(max_digits=10, decimal_places=2, default=0, help_text="Grand total for the order")
+    currency = models.CharField(max_length=3, default='INR')
+    tip_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    bill_clear = models.BooleanField(default=False)
     estimated_time = models.IntegerField()
     special_instructions = models.TextField(null=True, blank=True)
-    status = models.CharField(max_length=20)
+    status = models.CharField(max_length=20, default='pending')
+    # Payment state
+    payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='unpaid')
+    payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES, default='unknown')
+    paid_at = models.DateTimeField(null=True, blank=True)
+    invoice_number = models.CharField(max_length=50, blank=True, null=True, unique=True)
     table_unique_id = models.CharField(max_length=50, null=True, blank=True)
     room_unique_id = models.CharField(max_length=50, null=True, blank=True)  # For room orders
     order_type = models.CharField(max_length=10, choices=[('table', 'Table'), ('room', 'Room')], default='table')
@@ -224,35 +465,113 @@ class order(models.Model):
         ordering = ['-created_at']
     
     def __str__(self):
-        return f"Order {self.id} - {self.name}"
+        restaurant_name = self.restaurant.name if self.restaurant else 'No Restaurant'
+        return f"{restaurant_name} - Order {self.id} - {self.name}"
+
+    @property
+    def subtotal(self):
+        """Basic subtotal; for now equal to price minus tip."""
+        return max(self.price - self.tip_amount, 0)
 
 
 class bill(models.Model):
+    PAYMENT_STATUS_CHOICES = [
+        ('unpaid', 'Unpaid'),
+        ('pending_payment', 'Pending Payment'),
+        ('paid', 'Paid'),
+        ('failed', 'Failed'),
+        ('refunded', 'Refunded'),
+    ]
+
+    PAYMENT_METHOD_CHOICES = [
+        ('unknown', 'Unknown'),
+        ('cash', 'Cash'),
+        ('card', 'Card'),
+        ('upi', 'UPI'),
+        ('online_gateway', 'Online Gateway'),
+    ]
+
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='bills', null=True, blank=True)
+    order = models.OneToOneField(order, on_delete=models.CASCADE, related_name='bill', null=True, blank=True)
     order_items = models.CharField(max_length=5000)
     name = models.CharField(default='', max_length=50)
-    bill_total = models.IntegerField()
+    bill_total = models.DecimalField(max_digits=10, decimal_places=2)
+    currency = models.CharField(max_length=3, default='INR')
     phone = models.CharField(max_length=10)
     bill_time = models.DateTimeField()
     table_number = models.CharField(max_length=10, blank=True, null=True)
+    invoice_number = models.CharField(max_length=50, blank=True, null=True, unique=True)
+    payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='unpaid')
+    payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES, default='unknown')
+    tip_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    def __str__(self):
+        restaurant_name = self.restaurant.name if self.restaurant else 'No Restaurant'
+        return f"{restaurant_name} - Bill {self.id} - {self.name}"
+
+
+class Payment(models.Model):
+    """Payment record linked to orders/bills and external gateways."""
+    STATUS_CHOICES = [
+        ('created', 'Created'),
+        ('pending', 'Pending'),
+        ('succeeded', 'Succeeded'),
+        ('failed', 'Failed'),
+        ('refunded', 'Refunded'),
+        ('cancelled', 'Cancelled'),
+    ]
+
+    PROVIDER_CHOICES = [
+        ('manual', 'Manual / Cash'),
+        ('stripe', 'Stripe'),
+        ('razorpay', 'Razorpay'),
+        ('paypal', 'PayPal'),
+        ('other', 'Other'),
+    ]
+
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='payments', null=True, blank=True)
+    order = models.ForeignKey(order, on_delete=models.CASCADE, related_name='payments', null=True, blank=True)
+    bill = models.ForeignKey(bill, on_delete=models.CASCADE, related_name='payments', null=True, blank=True)
+    provider = models.CharField(max_length=20, choices=PROVIDER_CHOICES, default='manual')
+    provider_payment_id = models.CharField(max_length=100, blank=True, null=True)
+    provider_order_id = models.CharField(max_length=100, blank=True, null=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    currency = models.CharField(max_length=3, default='INR')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='created')
+    raw_response = models.JSONField(default=dict, blank=True)
+    error_message = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.get_provider_display()} payment {self.id} - {self.status}"
 
 
 class Department(models.Model):
     id = models.AutoField(primary_key=True)
-    name = models.CharField(max_length=100, unique=True)
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='departments', null=True, blank=True)
+    name = models.CharField(max_length=100)
     description = models.TextField(blank=True, null=True)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
+        if self.restaurant:
+            return f"{self.restaurant.name} - {self.name}"
         return self.name
 
     class Meta:
-        ordering = ['name']
+        ordering = ['restaurant', 'name']
+        unique_together = [['restaurant', 'name']]
 
 class Role(models.Model):
     id = models.AutoField(primary_key=True)
-    name = models.CharField(max_length=100, unique=True)
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='roles', null=True, blank=True)
+    name = models.CharField(max_length=100)
     description = models.TextField(blank=True, null=True)
     department = models.ForeignKey(Department, on_delete=models.CASCADE, related_name='roles')
     is_active = models.BooleanField(default=True)
@@ -260,10 +579,12 @@ class Role(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
-        return f"{self.name} - {self.department.name}"
+        restaurant_name = self.restaurant.name if self.restaurant else 'No Restaurant'
+        return f"{restaurant_name} - {self.name} - {self.department.name}"
 
     class Meta:
-        ordering = ['department', 'name']
+        ordering = ['restaurant', 'department', 'name']
+        unique_together = [['restaurant', 'name', 'department']]
 
 class Staff(models.Model):
     EMPLOYMENT_STATUS_CHOICES = [
@@ -280,11 +601,12 @@ class Staff(models.Model):
     ]
 
     id = models.AutoField(primary_key=True)
-    employee_id = models.CharField(max_length=20, unique=True)
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='staff_members', null=True, blank=True)
+    employee_id = models.CharField(max_length=20)
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='staff_profile')
     first_name = models.CharField(max_length=100)
     last_name = models.CharField(max_length=100)
-    email = models.EmailField(unique=True)
+    email = models.EmailField()
     phone = models.CharField(max_length=15)
     date_of_birth = models.DateField()
     gender = models.CharField(max_length=10, choices=GENDER_CHOICES)
@@ -302,14 +624,16 @@ class Staff(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
-        return f"{self.employee_id} - {self.first_name} {self.last_name}"
+        restaurant_name = self.restaurant.name if self.restaurant else 'No Restaurant'
+        return f"{restaurant_name} - {self.employee_id} - {self.first_name} {self.last_name}"
 
     @property
     def full_name(self):
         return f"{self.first_name} {self.last_name}"
 
     class Meta:
-        ordering = ['employee_id']
+        ordering = ['restaurant', 'employee_id']
+        unique_together = [['restaurant', 'employee_id']]
 
 class Attendance(models.Model):
     ATTENDANCE_STATUS_CHOICES = [
@@ -321,7 +645,8 @@ class Attendance(models.Model):
     ]
 
     id = models.AutoField(primary_key=True)
-    staff = models.ForeignKey(Staff, on_delete=models.CASCADE, related_name='attendance_records')
+    employee = models.ForeignKey('Employee', on_delete=models.CASCADE, related_name='attendance_records', null=True, blank=True)
+    staff = models.ForeignKey('Staff', on_delete=models.CASCADE, related_name='attendance_records', null=True, blank=True)  # Legacy, will be removed
     date = models.DateField()
     check_in_time = models.TimeField(blank=True, null=True)
     check_out_time = models.TimeField(blank=True, null=True)
@@ -331,11 +656,12 @@ class Attendance(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        unique_together = ['staff', 'date']
+        unique_together = [['employee', 'date']]  # Updated to use employee
         ordering = ['-date', '-created_at']
 
     def __str__(self):
-        return f"{self.staff.full_name} - {self.date} - {self.status}"
+        employee_name = self.employee.full_name if self.employee else (self.staff.full_name if self.staff else 'Unknown')
+        return f"{employee_name} - {self.date} - {self.status}"
 
 class Leave(models.Model):
     LEAVE_TYPE_CHOICES = [
@@ -355,13 +681,15 @@ class Leave(models.Model):
     ]
 
     id = models.AutoField(primary_key=True)
-    staff = models.ForeignKey(Staff, on_delete=models.CASCADE, related_name='leaves')
+    employee = models.ForeignKey('Employee', on_delete=models.CASCADE, related_name='leaves', null=True, blank=True)
+    staff = models.ForeignKey('Staff', on_delete=models.CASCADE, related_name='leaves', null=True, blank=True)  # Legacy, will be removed
     leave_type = models.CharField(max_length=20, choices=LEAVE_TYPE_CHOICES)
     start_date = models.DateField()
     end_date = models.DateField()
     reason = models.TextField()
     status = models.CharField(max_length=20, choices=LEAVE_STATUS_CHOICES, default='pending')
-    approved_by = models.ForeignKey(Staff, on_delete=models.SET_NULL, null=True, blank=True, related_name='approved_leaves')
+    approved_by_employee = models.ForeignKey('Employee', on_delete=models.SET_NULL, null=True, blank=True, related_name='legacy_approved_leaves')
+    approved_by = models.ForeignKey('Staff', on_delete=models.SET_NULL, null=True, blank=True, related_name='approved_leaves')  # Legacy
     approved_at = models.DateTimeField(blank=True, null=True)
     notes = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -371,8 +699,307 @@ class Leave(models.Model):
         ordering = ['-start_date']
 
     def __str__(self):
-        return f"{self.staff.full_name} - {self.leave_type} - {self.start_date} to {self.end_date}"
+        employee_name = self.employee.full_name if self.employee else (self.staff.full_name if self.staff else 'Unknown')
+        return f"{employee_name} - {self.leave_type} - {self.start_date} to {self.end_date}"
 
     @property
     def duration_days(self):
         return (self.end_date - self.start_date).days + 1
+
+# HR Management System Models
+class HRDepartment(models.Model):
+    """HR Department for organizational structure"""
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='hr_departments', null=True, blank=True)
+    name = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    manager = models.ForeignKey('Employee', on_delete=models.SET_NULL, null=True, blank=True, related_name='managed_hr_departments')
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['restaurant', 'name']
+        unique_together = [['restaurant', 'name']]
+
+    def __str__(self):
+        if self.restaurant:
+            return f"{self.restaurant.name} - {self.name}"
+        return self.name
+
+class HRPosition(models.Model):
+    """HR Position/Role for employees"""
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='hr_positions', null=True, blank=True)
+    name = models.CharField(max_length=200)
+    department = models.ForeignKey(HRDepartment, on_delete=models.CASCADE, related_name='positions')
+    description = models.TextField(blank=True)
+    salary_range_min = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    salary_range_max = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['restaurant', 'department__name', 'name']
+        unique_together = [['restaurant', 'name', 'department']]
+
+    def __str__(self):
+        restaurant_name = self.restaurant.name if self.restaurant else 'No Restaurant'
+        return f"{restaurant_name} - {self.department.name} - {self.name}"
+
+class Employee(models.Model):
+    """Enhanced Employee model for HR management"""
+    STATUS_CHOICES = [
+        ('active', 'Active'),
+        ('inactive', 'Inactive'),
+        ('terminated', 'Terminated'),
+        ('on_leave', 'On Leave'),
+        ('probation', 'Probation'),
+    ]
+
+    GENDER_CHOICES = [
+        ('male', 'Male'),
+        ('female', 'Female'),
+        ('other', 'Other'),
+    ]
+
+    # Basic Information
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='employees', null=True, blank=True)
+    employee_id = models.CharField(max_length=20, verbose_name="Employee ID")
+    personnel_number = models.CharField(max_length=20, verbose_name="Personnel Number")
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='employee_profile', null=True, blank=True)
+    
+    # Personal Information
+    first_name = models.CharField(max_length=100)
+    last_name = models.CharField(max_length=100)
+    middle_name = models.CharField(max_length=100, blank=True)
+    gender = models.CharField(max_length=10, choices=GENDER_CHOICES, default='male')
+    date_of_birth = models.DateField()
+    email = models.EmailField()
+    phone = models.CharField(max_length=15)
+    
+    # Address Information
+    address = models.TextField()
+    city = models.CharField(max_length=100, blank=True)
+    state = models.CharField(max_length=100, blank=True)
+    postal_code = models.CharField(max_length=20, blank=True)
+    country = models.CharField(max_length=100, default='India')
+    
+    # Employment Information
+    position = models.ForeignKey(HRPosition, on_delete=models.CASCADE, related_name='employees')
+    department = models.ForeignKey(HRDepartment, on_delete=models.CASCADE, related_name='employees')
+    hire_date = models.DateField()
+    termination_date = models.DateField(null=True, blank=True)
+    employment_status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
+    
+    # Salary Information
+    base_salary = models.DecimalField(max_digits=10, decimal_places=2)
+    current_salary = models.DecimalField(max_digits=10, decimal_places=2)
+    salary_currency = models.CharField(max_length=3, default='INR')
+    
+    # Emergency Contact
+    emergency_contact_name = models.CharField(max_length=100)
+    emergency_contact_phone = models.CharField(max_length=15)
+    emergency_contact_relationship = models.CharField(max_length=50, blank=True)
+    
+    # Documents
+    profile_picture = models.ImageField(upload_to='employees/photos/', blank=True, null=True)
+    resume = models.FileField(upload_to='employees/resumes/', blank=True, null=True)
+    id_proof = models.FileField(upload_to='employees/documents/', blank=True, null=True)
+    
+    # Additional Information
+    notes = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['restaurant', 'employee_id']
+        unique_together = [
+            ['restaurant', 'employee_id'],
+            ['restaurant', 'personnel_number']
+        ]
+
+    def __str__(self):
+        restaurant_name = self.restaurant.name if self.restaurant else 'No Restaurant'
+        return f"{restaurant_name} - {self.employee_id} - {self.first_name} {self.last_name}"
+
+    @property
+    def full_name(self):
+        return f"{self.first_name} {self.last_name}"
+
+    @property
+    def years_of_service(self):
+        from datetime import date
+        if self.termination_date:
+            end_date = self.termination_date
+        else:
+            end_date = date.today()
+        return (end_date - self.hire_date).days // 365
+
+class EmployeeDocument(models.Model):
+    """Employee documents and certificates"""
+    DOCUMENT_TYPES = [
+        ('id_proof', 'ID Proof'),
+        ('resume', 'Resume'),
+        ('certificate', 'Certificate'),
+        ('contract', 'Employment Contract'),
+        ('other', 'Other'),
+    ]
+
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='documents')
+    document_type = models.CharField(max_length=20, choices=DOCUMENT_TYPES)
+    title = models.CharField(max_length=200)
+    file = models.FileField(upload_to='employees/documents/')
+    description = models.TextField(blank=True)
+    expiry_date = models.DateField(null=True, blank=True)
+    is_verified = models.BooleanField(default=False)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-uploaded_at']
+
+    def __str__(self):
+        return f"{self.employee.full_name} - {self.title}"
+
+class Payroll(models.Model):
+    """Employee payroll records"""
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='payrolls')
+    month = models.IntegerField()  # 1-12
+    year = models.IntegerField()
+    basic_salary = models.DecimalField(max_digits=10, decimal_places=2)
+    allowances = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    deductions = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    net_salary = models.DecimalField(max_digits=10, decimal_places=2)
+    payment_date = models.DateField()
+    payment_status = models.CharField(max_length=20, choices=[
+        ('pending', 'Pending'),
+        ('paid', 'Paid'),
+        ('cancelled', 'Cancelled'),
+    ], default='pending')
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ['employee', 'month', 'year']
+        ordering = ['-year', '-month']
+
+    def __str__(self):
+        return f"{self.employee.full_name} - {self.month}/{self.year}"
+
+class LeaveRequest(models.Model):
+    """Employee leave requests"""
+    LEAVE_TYPES = [
+        ('annual', 'Annual Leave'),
+        ('sick', 'Sick Leave'),
+        ('personal', 'Personal Leave'),
+        ('maternity', 'Maternity Leave'),
+        ('paternity', 'Paternity Leave'),
+        ('bereavement', 'Bereavement Leave'),
+        ('other', 'Other'),
+    ]
+
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+        ('cancelled', 'Cancelled'),
+    ]
+
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='leave_requests')
+    leave_type = models.CharField(max_length=20, choices=LEAVE_TYPES)
+    start_date = models.DateField()
+    end_date = models.DateField()
+    reason = models.TextField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    approved_by = models.ForeignKey(Employee, on_delete=models.SET_NULL, null=True, blank=True, related_name='approved_leaves')
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.employee.full_name} - {self.leave_type} ({self.start_date} to {self.end_date})"
+
+    @property
+    def duration_days(self):
+        return (self.end_date - self.start_date).days + 1
+
+class PerformanceReview(models.Model):
+    """Employee performance reviews"""
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='performance_reviews')
+    review_period_start = models.DateField()
+    review_period_end = models.DateField()
+    reviewer = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='conducted_reviews')
+    overall_rating = models.IntegerField(choices=[(i, i) for i in range(1, 6)])  # 1-5 scale
+    strengths = models.TextField()
+    areas_for_improvement = models.TextField()
+    goals = models.TextField()
+    comments = models.TextField(blank=True)
+    review_date = models.DateField()
+    next_review_date = models.DateField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-review_date']
+
+    def __str__(self):
+        return f"{self.employee.full_name} - {self.review_period_start} to {self.review_period_end}"
+
+class Training(models.Model):
+    """Employee training records"""
+    TRAINING_TYPES = [
+        ('onboarding', 'Onboarding'),
+        ('skill_development', 'Skill Development'),
+        ('compliance', 'Compliance'),
+        ('leadership', 'Leadership'),
+        ('technical', 'Technical'),
+        ('other', 'Other'),
+    ]
+
+    STATUS_CHOICES = [
+        ('scheduled', 'Scheduled'),
+        ('in_progress', 'In Progress'),
+        ('completed', 'Completed'),
+        ('cancelled', 'Cancelled'),
+    ]
+
+    title = models.CharField(max_length=200)
+    description = models.TextField()
+    training_type = models.CharField(max_length=20, choices=TRAINING_TYPES)
+    trainer = models.CharField(max_length=100)
+    start_date = models.DateTimeField()
+    end_date = models.DateTimeField()
+    location = models.CharField(max_length=200, blank=True)
+    max_participants = models.IntegerField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='scheduled')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-start_date']
+
+    def __str__(self):
+        return f"{self.title} - {self.start_date.date()}"
+
+class TrainingEnrollment(models.Model):
+    """Employee training enrollments"""
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='training_enrollments')
+    training = models.ForeignKey(Training, on_delete=models.CASCADE, related_name='enrollments')
+    enrollment_date = models.DateTimeField(auto_now_add=True)
+    completion_date = models.DateTimeField(null=True, blank=True)
+    certificate_issued = models.BooleanField(default=False)
+    certificate_file = models.FileField(upload_to='training/certificates/', blank=True, null=True)
+    feedback = models.TextField(blank=True)
+    rating = models.IntegerField(choices=[(i, i) for i in range(1, 6)], null=True, blank=True)
+
+    class Meta:
+        unique_together = ['employee', 'training']
+        ordering = ['-enrollment_date']
+
+    def __str__(self):
+        return f"{self.employee.full_name} - {self.training.title}"

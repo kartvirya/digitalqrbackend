@@ -1,0 +1,7 @@
+Django>=4.1.2
+djangorestframework
+django-cors-headers
+Pillow
+qrcode
+django-filter
+

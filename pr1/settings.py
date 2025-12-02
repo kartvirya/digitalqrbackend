@@ -41,7 +41,7 @@ def get_local_ip():
         return os.environ.get('LOCAL_IP', '127.0.0.1')
 
 # Frontend URL for QR codes - dynamically detected
-FRONTEND_URL = f'http://{get_local_ip()}:3000'
+FRONTEND_URL = f'http://{get_local_ip()}:5173'
 
 ALLOWED_HOSTS = [
     'e0398dde-191c-43d5-8dfc-bc9e465afc40.id.repl.co',
@@ -60,10 +60,11 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'django.contrib.humanize',
-    'corsheaders',
     'rest_framework',
+    'rest_framework.authtoken',
+    'corsheaders',
     'cafe',
+    'django_filters',
 ]
 
 MIDDLEWARE = [
@@ -74,6 +75,7 @@ MIDDLEWARE = [
     'cafe.middleware.CsrfExemptMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'cafe.middleware.RestaurantContextMiddleware',  # Add restaurant context middleware
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -86,12 +88,36 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:3001",
     "http://localhost:3002",
     "http://127.0.0.1:3002",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
     f"http://{get_local_ip()}:3000",
     f"http://{get_local_ip()}:3001",
     f"http://{get_local_ip()}:3002",
+    f"http://{get_local_ip()}:5173",
 ]
 
 CORS_ALLOW_CREDENTIALS = True
+
+# Allow custom restaurant headers
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+    'x-restaurant-id',
+    'x-restaurant-slug',
+]
+
+# Authentication backends
+AUTHENTICATION_BACKENDS = [
+    'cafe.backends.PhoneBackend',
+    'django.contrib.auth.backends.ModelBackend',
+]
 
 # CSRF settings for API - dynamic
 CSRF_TRUSTED_ORIGINS = [
@@ -101,9 +127,12 @@ CSRF_TRUSTED_ORIGINS = [
     "http://127.0.0.1:3001",
     "http://localhost:3002",
     "http://127.0.0.1:3002",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
     f"http://{get_local_ip()}:3000",
     f"http://{get_local_ip()}:3001",
     f"http://{get_local_ip()}:3002",
+    f"http://{get_local_ip()}:5173",
 ]
 
 # REST Framework settings
@@ -198,3 +227,14 @@ STATIC_URL = 'static/'
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media/')
+
+# Session configuration for cross-origin requests
+SESSION_COOKIE_SECURE = False  # Set to True in production with HTTPS
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = 'Lax'  # Allows cookies to be sent with cross-site requests
+SESSION_COOKIE_AGE = 86400  # 24 hours
+
+# CSRF cookie settings
+CSRF_COOKIE_SECURE = False  # Set to True in production with HTTPS
+CSRF_COOKIE_HTTPONLY = False  # Must be False for JavaScript to read CSRF token
+CSRF_COOKIE_SAMESITE = 'Lax'
