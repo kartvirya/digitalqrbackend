@@ -1,6 +1,7 @@
 import socketio
 import eventlet
 import json
+import os
 import time
 from flask import Flask, request, jsonify
 
@@ -9,10 +10,13 @@ print("🚀 Starting Socket.IO server...")
 # Create a Flask app for HTTP endpoints
 flask_app = Flask(__name__)
 
+socket_host = os.environ.get('SOCKET_SERVER_HOST', '0.0.0.0')
+socket_port = int(os.environ.get('SOCKET_SERVER_PORT', '8001'))
+allowed_origins = [origin.strip() for origin in os.environ.get('SOCKET_CORS_ALLOWED_ORIGINS', '*').split(',') if origin.strip()]
+
 # Create a Socket.IO server instance
-# Allow all origins for development (you can restrict this in production)
 sio = socketio.Server(
-    cors_allowed_origins="*",  # Allow all origins for development
+    cors_allowed_origins=allowed_origins if allowed_origins != ['*'] else '*',
     async_mode='eventlet'
 )
 
@@ -327,10 +331,10 @@ def emit_order_status_to_tracking(order_id, order_data):
     }, room=tracking_room)
 
 if __name__ == '__main__':
-    print("🚀 Starting Socket.IO server on port 8001...")
+    print(f"🚀 Starting Socket.IO server on {socket_host}:{socket_port}...")
     print("✅ Socket.IO server is ready!")
     print("🔌 Listening for connections...")
-    print("📱 Frontend should connect to: http://localhost:8001")
+    print(f"📱 Frontend should connect to: http://localhost:{socket_port}")
     print("🌐 Django API is on: http://localhost:8000")
     print("🔗 HTTP endpoints available:")
     print("   - POST /emit_new_order")
@@ -339,6 +343,4 @@ if __name__ == '__main__':
     print("Press Ctrl+C to stop the server")
     print("=" * 50)
     
-    # Run the Socket.IO server
-    # Bind to 0.0.0.0 to accept connections from all network interfaces
-    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', 8001)), app)
+    eventlet.wsgi.server(eventlet.listen((socket_host, socket_port)), app)

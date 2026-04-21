@@ -11,6 +11,7 @@ import json
 from django.utils import timezone
 from datetime import date, datetime, timedelta
 from rest_framework.permissions import IsAuthenticatedOrReadOnly
+from django.conf import settings
 from django.db import transaction
 from django.contrib.sessions.models import Session
 import os
@@ -78,6 +79,15 @@ def tenant_scoped_queryset(queryset, request, field_name='restaurant'):
 def get_order_for_write_request(request, order_id):
     """Resolve order for status/payment actions with restaurant scoping."""
     oid = int(order_id)
+
+
+def emit_socket_event(path, payload):
+    try:
+        requests.post(f"{settings.SOCKET_SERVER_URL}{path}", json=payload, timeout=1)
+        return True
+    except Exception as error:
+        print(f"❌ Socket.IO emit failed: {error}")
+        return False
     restaurant = resolve_request_restaurant(request)
     if restaurant:
         return get_object_or_404(order, id=oid, restaurant=restaurant)
@@ -907,13 +917,8 @@ class OrderViewSet(viewsets.ModelViewSet):
             headers = self.get_success_headers(serializer.data)
             
             # Emit Socket.IO event for new order via HTTP request
-            try:
-                requests.post('http://localhost:8001/emit_new_order', 
-                            json={'order': serializer.data}, 
-                            timeout=1)
+            if emit_socket_event('/emit_new_order', {'order': serializer.data}):
                 print(f"✅ Socket.IO: New order event emitted for order {serializer.data.get('id')}")
-            except Exception as e:
-                print(f"❌ Socket.IO emit failed: {e}")
             
             return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
         except Exception as ex:
@@ -1025,18 +1030,16 @@ class OrderViewSet(viewsets.ModelViewSet):
             )
             
             # Emit Socket.IO event for order status update via HTTP request
-            try:
-                user_type = 'admin' if (request.user.is_authenticated and (request.user.is_superuser or getattr(request.user, 'cafe_manager', False) or request.user.is_restaurant_admin())) else 'staff'
-                requests.post('http://localhost:8001/emit_order_update', 
-                            json={
-                                'order_id': order_obj.id, 
-                                'status': new_status, 
-                                'user_type': user_type
-                            }, 
-                            timeout=1)
+            user_type = 'admin' if (request.user.is_authenticated and (request.user.is_superuser or getattr(request.user, 'cafe_manager', False) or request.user.is_restaurant_admin())) else 'staff'
+            if emit_socket_event(
+                '/emit_order_update',
+                {
+                    'order_id': order_obj.id,
+                    'status': new_status,
+                    'user_type': user_type,
+                },
+            ):
                 print(f"✅ Socket.IO: Order update event emitted for order {order_obj.id}")
-            except Exception as e:
-                print(f"❌ Socket.IO emit failed: {e}")
             
             serializer = self.get_serializer(order_obj)
             return Response({'success': True, 'status': new_status, 'order': serializer.data}, status=status.HTTP_200_OK)
@@ -1064,19 +1067,15 @@ class OrderViewSet(viewsets.ModelViewSet):
         order_obj.assigned_runner = runner
         order_obj.assigned_at = timezone.now()
         order_obj.save(update_fields=['assigned_runner', 'assigned_at'])
-        try:
-            requests.post(
-                'http://localhost:8001/emit_order_update',
-                json={
-                    'order_id': order_obj.id,
-                    'status': order_obj.status,
-                    'user_type': 'staff',
-                    'assigned_runner_id': runner.id,
-                },
-                timeout=1,
-            )
-        except Exception as e:
-            print(f'❌ Socket.IO assign_runner emit failed: {e}')
+        emit_socket_event(
+            '/emit_order_update',
+            {
+                'order_id': order_obj.id,
+                'status': order_obj.status,
+                'user_type': 'staff',
+                'assigned_runner_id': runner.id,
+            },
+        )
         serializer = self.get_serializer(order_obj)
         return Response({'success': True, 'order': serializer.data}, status=status.HTTP_200_OK)
 
@@ -1128,19 +1127,15 @@ class OrderViewSet(viewsets.ModelViewSet):
             )
 
             # Notify via Socket.IO that payment completed
-            try:
-                requests.post(
-                    'http://localhost:8001/emit_order_update',
-                    json={
-                        'order_id': order_obj.id,
-                        'status': order_obj.status,
-                        'user_type': 'admin',
-                        'payment_status': order_obj.payment_status,
-                    },
-                    timeout=1,
-                )
-            except Exception as e:
-                print(f"❌ Socket.IO payment emit failed: {e}")
+            emit_socket_event(
+                '/emit_order_update',
+                {
+                    'order_id': order_obj.id,
+                    'status': order_obj.status,
+                    'user_type': 'admin',
+                    'payment_status': order_obj.payment_status,
+                },
+            )
 
             serializer = self.get_serializer(order_obj)
             return Response({'success': True, 'order': serializer.data}, status=status.HTTP_200_OK)

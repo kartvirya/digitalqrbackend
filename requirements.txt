@@ -5,4 +5,9 @@ Pillow
 qrcode
 django-filter
 requests
+gunicorn
+Flask
+python-socketio
+eventlet
+psycopg[binary]
 
