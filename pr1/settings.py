@@ -1,6 +1,7 @@
 """Django settings for pr1 project."""
 import os
 import socket
+from django.core.exceptions import ImproperlyConfigured
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -19,6 +20,8 @@ def env_list(name, default=""):
 def build_database_config():
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not database_url:
+        if not DEBUG:
+            raise ImproperlyConfigured("DATABASE_URL must be set in production. PostgreSQL is required.")
         return {
             "ENGINE": "django.db.backends.sqlite3",
             "NAME": os.environ.get("SQLITE_PATH", BASE_DIR / "db.sqlite3"),

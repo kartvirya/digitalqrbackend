@@ -4,9 +4,9 @@ A modern, full-stack food ordering system with QR code-based table management, r
 
 ## 🏗️ Architecture
 
-- **Backend**: Django REST API with SQLite database
+- **Backend**: Django REST API with PostgreSQL in production
 - **Frontend**: React with TypeScript and Material-UI
-- **Database**: SQLite (production-ready with PostgreSQL support)
+- **Database**: SQLite for local development, PostgreSQL for production
 
 ## ✨ Features
 
@@ -176,7 +176,7 @@ npm start
 
 ## 📊 Database
 
-The system uses SQLite by default, which is perfect for development and small to medium deployments. For production, you can easily switch to PostgreSQL by updating the database configuration in `pr1/settings.py`.
+The system uses SQLite only for local development. Production deployments should use PostgreSQL via the DATABASE_URL environment variable.
 
 ## 🤝 Contributing
 
