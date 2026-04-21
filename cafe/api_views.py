@@ -5,11 +5,14 @@ from rest_framework.exceptions import PermissionDenied
 from django.shortcuts import get_object_or_404
 from django.contrib.auth import authenticate, login, logout
 from django.db.models import Q, Count, Avg, Sum, Max
+from django.contrib.admin.models import LogEntry
 from datetime import date
 import json
 from django.utils import timezone
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from rest_framework.permissions import IsAuthenticatedOrReadOnly
+from django.db import transaction
+from django.contrib.sessions.models import Session
 import os
 import sys
 import requests
@@ -22,7 +25,8 @@ from .models import (
     Restaurant, User, Table, Floor, Room, menu_item, order, rating, bill,
     Department, Role, Staff, Attendance, Leave,
     HRDepartment, HRPosition, Employee, EmployeeDocument, Payroll, LeaveRequest, PerformanceReview, Training, TrainingEnrollment,
-    Permission, RolePermission, Payment
+    Permission, RolePermission, Payment, SubscriptionPlan, RestaurantSubscription, TenantUsageSnapshot,
+    BillingInvoice, BillingTransaction, PlatformAuditLog,
 )
 from .serializers import (
     RestaurantSerializer, UserSerializer, TableSerializer, FloorSerializer, RoomSerializer, MenuItemSerializer, 
@@ -30,9 +34,90 @@ from .serializers import (
     DepartmentSerializer, RoleSerializer, StaffSerializer, StaffCreateSerializer,
     AttendanceSerializer, LeaveSerializer,
     HRDepartmentSerializer, HRPositionSerializer, EmployeeSerializer, EmployeeCreateSerializer, EmployeeDocumentSerializer, PayrollSerializer, LeaveRequestSerializer, PerformanceReviewSerializer, TrainingSerializer, TrainingEnrollmentSerializer,
-    PaymentSerializer
+    PaymentSerializer, SubscriptionPlanSerializer, RestaurantSubscriptionSerializer, TenantUsageSnapshotSerializer,
+    BillingInvoiceSerializer, BillingTransactionSerializer, PlatformAuditLogSerializer,
 )
-from .permissions import IsSuperAdmin, IsRestaurantAdmin, IsHRManager, IsStaff, HasPermission, IsRestaurantScoped
+from .permissions import (
+    IsSuperAdmin,
+    IsRestaurantAdmin,
+    IsHRManager,
+    IsStaff,
+    HasPermission,
+    IsRestaurantScoped,
+    OrderCreatePermission,
+    OrderListRetrievePermission,
+    OrderUpdateStatusPermission,
+    OrderMarkPaidPermission,
+    OrderAssignRunnerPermission,
+    OrderClearTablePermission,
+    order_transition_allowed,
+    is_restaurant_power_user,
+)
+from .inventory_service import consume_stock_for_order, reverse_stock_for_order
+from .billing.providers.esewa import EsewaBillingProvider
+
+
+def resolve_request_restaurant(request):
+    restaurant = getattr(request, 'restaurant', None)
+    if not restaurant and request.user.is_authenticated and getattr(request.user, 'restaurant', None):
+        restaurant = request.user.restaurant
+    if not restaurant and request.user.is_authenticated and hasattr(request.user, 'staff_profile'):
+        restaurant = getattr(request.user.staff_profile, 'restaurant', None)
+    return restaurant
+
+
+def tenant_scoped_queryset(queryset, request, field_name='restaurant'):
+    restaurant = resolve_request_restaurant(request)
+    if restaurant:
+        return queryset.filter(**{field_name: restaurant})
+    if request.user.is_authenticated and (request.user.is_super_admin or request.user.is_superuser):
+        return queryset
+    return queryset.none()
+
+
+def get_order_for_write_request(request, order_id):
+    """Resolve order for status/payment actions with restaurant scoping."""
+    oid = int(order_id)
+    restaurant = resolve_request_restaurant(request)
+    if restaurant:
+        return get_object_or_404(order, id=oid, restaurant=restaurant)
+    if request.user.is_authenticated and (
+        request.user.is_super_admin or request.user.is_superuser
+    ):
+        return get_object_or_404(order, id=oid)
+    raise PermissionDenied('Restaurant context is required for this action.')
+
+
+def log_platform_action(
+    *,
+    actor,
+    action,
+    restaurant=None,
+    target_type='',
+    target_id='',
+    before_state=None,
+    after_state=None,
+    metadata=None,
+):
+    def _safe_json(data):
+        if isinstance(data, dict):
+            return {k: _safe_json(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [_safe_json(v) for v in data]
+        if isinstance(data, (datetime, date)):
+            return data.isoformat()
+        return data
+
+    PlatformAuditLog.objects.create(
+        actor=actor if actor and actor.is_authenticated else None,
+        restaurant=restaurant,
+        action=action,
+        target_type=target_type,
+        target_id=str(target_id or ''),
+        before_state=_safe_json(before_state or {}),
+        after_state=_safe_json(after_state or {}),
+        metadata=_safe_json(metadata or {}),
+    )
 
 
 class RestaurantViewSet(viewsets.ModelViewSet):
@@ -42,9 +127,34 @@ class RestaurantViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
     
     def get_permissions(self):
-        if self.action in ['list', 'retrieve']:
+        if self.action in ['list', 'retrieve', 'public_landing']:
             return [permissions.AllowAny()]  # Allow viewing restaurants
         return [permissions.IsAuthenticated()]
+
+    def _default_landing_config(self, restaurant):
+        display_name = restaurant.name if restaurant else 'Our Restaurant'
+        return {
+            'brand_name': display_name,
+            'hero_title': f'Welcome to {display_name}',
+            'hero_subtitle': 'Delightful dining experiences for hotels and restaurants.',
+            'hero_cta_text': 'View Menu',
+            'hero_cta_link': '/',
+            'about_title': 'About Us',
+            'about_text': 'We serve handcrafted food with exceptional hospitality.',
+            'address': restaurant.address if restaurant and restaurant.address else '',
+            'phone': restaurant.phone if restaurant and restaurant.phone else '',
+            'email': restaurant.email if restaurant and restaurant.email else '',
+            'opening_hours': 'Mon-Sun: 10:00 AM - 11:00 PM',
+            'primary_color': '#d0155c',
+            'secondary_color': '#111827',
+            'show_gallery': True,
+            'gallery_images': [],
+            'highlights': [
+                {'title': 'Fine Dining', 'description': 'Curated menu with premium ingredients.'},
+                {'title': 'Hotel Service', 'description': 'Room dining and concierge support.'},
+                {'title': 'Events', 'description': 'Private events and celebrations available.'},
+            ],
+        }
     
     def get_queryset(self):
         user = self.request.user
@@ -160,6 +270,91 @@ class RestaurantViewSet(viewsets.ModelViewSet):
         if not (self.request.user.is_super_admin or self.request.user.is_superuser):
             raise PermissionDenied("Only super administrators can delete restaurants")
         instance.delete()
+
+    @action(detail=False, methods=['get'])
+    def public_landing(self, request):
+        slug = request.query_params.get('slug')
+        if not slug:
+            return Response({'error': 'slug query param is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            restaurant = Restaurant.objects.get(slug=slug, is_active=True)
+        except Restaurant.DoesNotExist:
+            return Response({'error': 'Restaurant not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        settings_dict = restaurant.settings or {}
+        config = settings_dict.get('landing_page', {})
+        payload = self._default_landing_config(restaurant)
+        payload.update(config)
+        payload['slug'] = restaurant.slug
+        payload['restaurant_name'] = restaurant.name
+        return Response(payload)
+
+    @action(detail=False, methods=['get', 'patch'])
+    def landing_config(self, request):
+        if not request.user.is_authenticated:
+            return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        restaurant = None
+        slug = request.query_params.get('slug') or request.data.get('slug')
+        if request.user.is_super_admin or request.user.is_superuser:
+            restaurant_id = request.query_params.get('restaurant_id') or request.data.get('restaurant_id')
+            if restaurant_id:
+                try:
+                    restaurant = Restaurant.objects.get(id=restaurant_id)
+                except Restaurant.DoesNotExist:
+                    return Response({'error': 'Restaurant not found'}, status=status.HTTP_404_NOT_FOUND)
+            elif slug:
+                try:
+                    restaurant = Restaurant.objects.get(slug=slug, is_active=True)
+                except Restaurant.DoesNotExist:
+                    return Response({'error': 'Restaurant not found'}, status=status.HTTP_404_NOT_FOUND)
+        if not restaurant:
+            restaurant = request.user.restaurant
+
+        is_admin_like = bool(
+            request.user.is_super_admin
+            or request.user.is_superuser
+            or getattr(request.user, 'cafe_manager', False)
+            or request.user.is_restaurant_admin()
+        )
+
+        # Backward-compatibility fallback for admin users without restaurant FK.
+        if not restaurant and is_admin_like:
+            if slug:
+                restaurant = Restaurant.objects.filter(slug=slug, is_active=True).first()
+            if not restaurant:
+                restaurant = Restaurant.objects.filter(is_active=True).order_by('id').first()
+
+        if not restaurant:
+            return Response({'error': 'Restaurant context is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not (request.user.is_super_admin or request.user.is_superuser or request.user.is_restaurant_admin()):
+            return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
+
+        settings_dict = restaurant.settings or {}
+        existing = settings_dict.get('landing_page', {})
+        current = self._default_landing_config(restaurant)
+        current.update(existing)
+
+        if request.method.lower() == 'get':
+            current['slug'] = restaurant.slug
+            current['restaurant_name'] = restaurant.name
+            return Response(current)
+
+        allowed_fields = {
+            'brand_name', 'hero_title', 'hero_subtitle', 'hero_cta_text', 'hero_cta_link',
+            'about_title', 'about_text', 'address', 'phone', 'email', 'opening_hours',
+            'primary_color', 'secondary_color', 'show_gallery', 'gallery_images', 'highlights'
+        }
+        updates = {k: v for k, v in request.data.items() if k in allowed_fields}
+        current.update(updates)
+        settings_dict['landing_page'] = current
+        restaurant.settings = settings_dict
+        restaurant.save(update_fields=['settings', 'updated_at'])
+        current['slug'] = restaurant.slug
+        current['restaurant_name'] = restaurant.name
+        return Response(current)
     
     @action(detail=True, methods=['post'])
     def activate(self, request, pk=None):
@@ -194,10 +389,23 @@ class MenuItemViewSet(viewsets.ModelViewSet):
         restaurant = getattr(self.request, 'restaurant', None)
         if restaurant:
             queryset = queryset.filter(restaurant=restaurant)
+        elif (
+            self.request.user.is_authenticated
+            and hasattr(self.request.user, 'staff_profile')
+            and self.request.user.staff_profile.restaurant_id
+        ):
+            queryset = queryset.filter(restaurant_id=self.request.user.staff_profile.restaurant_id)
+        elif self.action in ['list', 'retrieve']:
+            # Keep public menu usable even when context headers/slug are missing.
+            fallback_restaurant = Restaurant.objects.filter(is_active=True).order_by('id').first()
+            if fallback_restaurant:
+                queryset = queryset.filter(restaurant=fallback_restaurant)
+            else:
+                queryset = queryset.none()
         elif not (self.request.user.is_authenticated and (self.request.user.is_super_admin or self.request.user.is_superuser)):
             # Non-super-admin users must have a restaurant context
             queryset = queryset.none()
-        
+
         return queryset
     
     def perform_create(self, serializer):
@@ -207,10 +415,19 @@ class MenuItemViewSet(viewsets.ModelViewSet):
         
         restaurant = getattr(self.request, 'restaurant', None)
         if not restaurant:
-            # Try to get from user's restaurant
             if self.request.user.is_authenticated and self.request.user.restaurant:
                 restaurant = self.request.user.restaurant
-            else:
+            elif (
+                self.request.user.is_authenticated
+                and (
+                    self.request.user.is_superuser
+                    or self.request.user.is_super_admin
+                    or self.request.user.cafe_manager
+                    or self.request.user.is_restaurant_admin()
+                )
+            ):
+                restaurant = Restaurant.objects.filter(is_active=True).order_by('id').first()
+            if not restaurant:
                 raise PermissionDenied("Restaurant context is required")
         
         # Set list_order if not provided - get the next order number for this restaurant and category
@@ -256,9 +473,15 @@ class FloorViewSet(viewsets.ModelViewSet):
         elif self.request.user.is_authenticated and (self.request.user.is_super_admin or self.request.user.is_superuser):
             # Super admin can see all floors
             pass
+        elif self.request.user.is_authenticated and hasattr(self.request.user, 'staff_profile'):
+            sp = self.request.user.staff_profile
+            if sp.restaurant_id:
+                queryset = queryset.filter(restaurant_id=sp.restaurant_id)
+            else:
+                queryset = queryset.none()
         elif not (self.request.user.is_authenticated and (self.request.user.is_superuser or self.request.user.cafe_manager)):
             queryset = queryset.none()
-        
+
         return queryset.filter(is_active=True).order_by('name')
     
     def perform_create(self, serializer):
@@ -269,7 +492,17 @@ class FloorViewSet(viewsets.ModelViewSet):
         if not restaurant:
             if self.request.user.is_authenticated and self.request.user.restaurant:
                 restaurant = self.request.user.restaurant
-            else:
+            elif (
+                self.request.user.is_authenticated
+                and (
+                    self.request.user.is_superuser
+                    or self.request.user.is_super_admin
+                    or self.request.user.cafe_manager
+                    or self.request.user.is_restaurant_admin()
+                )
+            ):
+                restaurant = Restaurant.objects.filter(is_active=True).order_by('id').first()
+            if not restaurant:
                 raise PermissionDenied("Restaurant context is required")
         serializer.save(restaurant=restaurant)
     
@@ -290,7 +523,8 @@ class TableViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticatedOrReadOnly]
     
     def get_permissions(self):
-        if self.action in ['list', 'retrieve']:
+        # Read-only discovery for menus / staff take-order (scoped in get_queryset).
+        if self.action in ['list', 'retrieve', 'by_floor']:
             return [permissions.AllowAny()]
         return [IsRestaurantAdmin()]
     
@@ -302,15 +536,24 @@ class TableViewSet(viewsets.ModelViewSet):
         restaurant = getattr(self.request, 'restaurant', None)
         if restaurant:
             queryset = queryset.filter(restaurant=restaurant)
-        elif not (user.is_authenticated and (user.is_super_admin or user.is_superuser)):
-            # Non-super-admin users must have a restaurant context
+        elif user.is_authenticated and (user.is_super_admin or user.is_superuser):
+            pass
+        elif user.is_authenticated and getattr(user, 'restaurant', None):
+            queryset = queryset.filter(restaurant=user.restaurant)
+        elif user.is_authenticated and hasattr(user, 'staff_profile'):
+            sp = user.staff_profile
+            if sp.restaurant_id:
+                queryset = queryset.filter(restaurant_id=sp.restaurant_id)
+            else:
+                queryset = queryset.none()
+        else:
             queryset = queryset.none()
-        
+
         # Filter by floor if specified
         floor_id = self.request.query_params.get('floor')
         if floor_id:
             queryset = queryset.filter(floor_id=floor_id)
-        
+
         if user.is_authenticated and (user.is_superuser or user.cafe_manager or user.is_super_admin):
             return queryset.order_by('table_number')
         return queryset.filter(is_active=True).order_by('table_number')
@@ -323,7 +566,17 @@ class TableViewSet(viewsets.ModelViewSet):
         if not restaurant:
             if self.request.user.is_authenticated and self.request.user.restaurant:
                 restaurant = self.request.user.restaurant
-            else:
+            elif (
+                self.request.user.is_authenticated
+                and (
+                    self.request.user.is_superuser
+                    or self.request.user.is_super_admin
+                    or self.request.user.cafe_manager
+                    or self.request.user.is_restaurant_admin()
+                )
+            ):
+                restaurant = Restaurant.objects.filter(is_active=True).order_by('id').first()
+            if not restaurant:
                 raise PermissionDenied("Restaurant context is required")
         serializer.save(restaurant=restaurant)
     
@@ -375,11 +628,12 @@ class TableViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def by_floor(self, request):
         floor_id = request.query_params.get('floor_id') or request.query_params.get('floor')
-        if floor_id:
-            tables = Table.objects.filter(floor_id=floor_id, is_active=True)
-            serializer = self.get_serializer(tables, many=True)
-            return Response(serializer.data)
-        return Response({'error': 'floor_id parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if not floor_id:
+            return Response({'error': 'floor_id parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+        # Use get_queryset() so staff / restaurant scoping matches list (not a global Table.objects leak).
+        tables = self.get_queryset().filter(floor_id=floor_id)
+        serializer = self.get_serializer(tables, many=True)
+        return Response(serializer.data)
 
 
 class RoomViewSet(viewsets.ModelViewSet):
@@ -425,7 +679,17 @@ class RoomViewSet(viewsets.ModelViewSet):
         if not restaurant:
             if self.request.user.is_authenticated and self.request.user.restaurant:
                 restaurant = self.request.user.restaurant
-            else:
+            elif (
+                self.request.user.is_authenticated
+                and (
+                    self.request.user.is_superuser
+                    or self.request.user.is_super_admin
+                    or self.request.user.cafe_manager
+                    or self.request.user.is_restaurant_admin()
+                )
+            ):
+                restaurant = Restaurant.objects.filter(is_active=True).order_by('id').first()
+            if not restaurant:
                 raise PermissionDenied("Restaurant context is required")
         serializer.save(restaurant=restaurant)
     
@@ -475,53 +739,26 @@ class RoomViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(rooms, many=True)
         return Response(serializer.data)
     
-    @action(detail=True, methods=['post'])
-    def regenerate_qr(self, request, pk=None):
-        table = self.get_object()
-        # Delete existing QR code
-        if table.qr_code:
-            table.qr_code.delete()
-        # Generate new QR code
-        table.generate_qr_code()
-        table.save()
-        serializer = self.get_serializer(table)
-        return Response(serializer.data)
-    
-    @action(detail=True, methods=['post'])
-    def update_position(self, request, pk=None):
-        table = self.get_object()
-        x = request.data.get('x', 0)
-        y = request.data.get('y', 0)
-        
-        table.visual_x = x
-        table.visual_y = y
-        table.save()
-        
-        serializer = self.get_serializer(table)
-        return Response(serializer.data)
-    
-    @action(detail=False, methods=['get'])
-    def by_floor(self, request):
-        floor_id = request.query_params.get('floor')
-        if floor_id:
-            tables = Table.objects.filter(floor_id=floor_id).order_by('table_number')
-            serializer = self.get_serializer(tables, many=True)
-            return Response(serializer.data)
-        return Response({'error': 'Floor parameter required'}, status=status.HTTP_400_BAD_REQUEST)
-
-
 class OrderViewSet(viewsets.ModelViewSet):
     queryset = order.objects.all().order_by('-created_at')
     serializer_class = OrderSerializer
     permission_classes = [permissions.IsAuthenticated]
-    
+
     def get_permissions(self):
-        if self.action in ['create', 'retrieve', 'by_table_unique_id', 'by_room_unique_id', 'clear_table', 'update_status']:
-            return [permissions.AllowAny()]  # Allow anonymous order creation, viewing, table/room queries, table clearing, and status updates
-        elif self.action == 'list':
-            # Allow list if user is authenticated OR if restaurant context is provided via headers
-            # This allows admin users to view orders for their restaurant even if session expired
-            return [permissions.AllowAny()]  # We'll check authentication/restaurant context in get_queryset
+        if self.action == 'create':
+            return [OrderCreatePermission()]
+        if self.action in ('list', 'retrieve'):
+            return [OrderListRetrievePermission()]
+        if self.action == 'update_status':
+            return [OrderUpdateStatusPermission(), permissions.IsAuthenticated()]
+        if self.action == 'mark_paid':
+            return [OrderMarkPaidPermission(), permissions.IsAuthenticated()]
+        if self.action == 'assign_runner':
+            return [OrderAssignRunnerPermission(), permissions.IsAuthenticated()]
+        if self.action == 'clear_table':
+            return [OrderClearTablePermission(), permissions.IsAuthenticated()]
+        if self.action in ('by_table', 'by_table_unique_id', 'by_room_unique_id', 'my_orders'):
+            return [permissions.IsAuthenticated() if self.action == 'my_orders' else permissions.AllowAny()]
         return [permissions.IsAuthenticated()]
     
     def create(self, request, *args, **kwargs):
@@ -529,8 +766,18 @@ class OrderViewSet(viewsets.ModelViewSet):
         data = request.data
         try:
             items = data.get('items', [])
-            table_unique_id = data.get('table_unique_id')
-            room_unique_id = data.get('room_unique_id')
+            table_unique_id = (
+                data.get('table_unique_id')
+                or request.query_params.get('table_unique_id')
+                or request.query_params.get('table')
+                or request.headers.get('X-Table-Unique-Id')
+            )
+            room_unique_id = (
+                data.get('room_unique_id')
+                or request.query_params.get('room_unique_id')
+                or request.query_params.get('room')
+                or request.headers.get('X-Room-Unique-Id')
+            )
             special_instructions = data.get('special_instructions', '')
             total_amount = data.get('total_amount', 0)
 
@@ -563,8 +810,27 @@ class OrderViewSet(viewsets.ModelViewSet):
                 if not restaurant and request.user.is_authenticated and request.user.restaurant:
                     restaurant = request.user.restaurant
             
+            # Final fallback for legacy data where table/room is found but has null restaurant.
+            if not restaurant:
+                restaurant = Restaurant.objects.filter(is_active=True).order_by('id').first()
+            
             if not restaurant:
                 return Response({'error': 'Restaurant context is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+            placed_by_val = 'customer'
+            placed_by_staff_obj = None
+            order_user = None
+            if request.user.is_authenticated:
+                order_user = request.user
+                if request.user.has_perm('cafe.can_place_waiter_order') and hasattr(
+                    request.user, 'staff_profile'
+                ):
+                    raw_pb = (data.get('placed_by') or 'waiter').lower()
+                    if raw_pb not in ('customer', 'waiter'):
+                        raw_pb = 'waiter'
+                    placed_by_val = raw_pb
+                    if placed_by_val == 'waiter':
+                        placed_by_staff_obj = request.user.staff_profile
 
             # Build items_json as { item_id: [quantity, name, unit_price] }
             items_map = {}
@@ -602,6 +868,9 @@ class OrderViewSet(viewsets.ModelViewSet):
                 table_unique_id=table_unique_id,
                 room_unique_id=room_unique_id,  # For room orders
                 order_type=order_type_value,
+                user=order_user,
+                placed_by=placed_by_val,
+                placed_by_staff=placed_by_staff_obj,
             )
 
             # Create bill entry
@@ -661,8 +930,10 @@ class OrderViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        queryset = order.objects.all()
-        
+        queryset = order.objects.select_related(
+            'placed_by_staff', 'assigned_runner', 'restaurant'
+        ).all()
+
         # Filter by restaurant
         restaurant = getattr(self.request, 'restaurant', None)
         if restaurant:
@@ -675,54 +946,83 @@ class OrderViewSet(viewsets.ModelViewSet):
             elif user.restaurant:
                 # Restaurant admin/staff can see their restaurant's orders
                 queryset = queryset.filter(restaurant=user.restaurant)
+            elif hasattr(user, 'staff_profile') and user.staff_profile.restaurant_id:
+                queryset = queryset.filter(restaurant_id=user.staff_profile.restaurant_id)
             else:
                 # Regular users can see their own orders
                 queryset = queryset.filter(phone=user.phone)
         else:
-            # Anonymous users need restaurant context
-            queryset = queryset.none()
+            # Anonymous QR users: allow access by explicit table/room context.
+            table_unique_id = (
+                self.request.query_params.get('table_unique_id')
+                or self.request.query_params.get('table')
+                or self.request.headers.get('X-Table-Unique-Id')
+            )
+            room_unique_id = (
+                self.request.query_params.get('room_unique_id')
+                or self.request.query_params.get('room')
+                or self.request.headers.get('X-Room-Unique-Id')
+            )
+            if table_unique_id:
+                queryset = queryset.filter(table_unique_id=table_unique_id)
+            elif room_unique_id:
+                queryset = queryset.filter(room_unique_id=room_unique_id)
+            else:
+                # Anonymous users without context cannot enumerate orders
+                queryset = queryset.none()
         
         return queryset.order_by('-created_at')
     
     @action(detail=True, methods=['post'])
     def update_status(self, request, pk=None):
         try:
-            # Get order by ID, with restaurant filtering if context is available
             order_id = pk or request.data.get('order_id')
             if not order_id:
                 return Response({'error': 'Order ID is required'}, status=status.HTTP_400_BAD_REQUEST)
-            
-            # Try to get order with restaurant context
-            restaurant = getattr(request, 'restaurant', None)
-            if restaurant:
-                try:
-                    order_obj = order.objects.get(id=order_id, restaurant=restaurant)
-                except order.DoesNotExist:
-                    return Response({'error': 'Order not found or does not belong to this restaurant'}, status=status.HTTP_404_NOT_FOUND)
-            else:
-                # Fallback: try to get order without restaurant filter (for super admin)
-                try:
-                    order_obj = order.objects.get(id=order_id)
-                except order.DoesNotExist:
-                    return Response({'error': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
-            
+
+            order_obj = get_order_for_write_request(request, order_id)
+
             new_status = request.data.get('status')
-            
-            # Valid order statuses (including completed)
-            valid_statuses = ['pending', 'confirmed', 'preparing', 'ready', 'served', 'delivered', 'cancelled', 'completed']
-            
+
+            valid_statuses = [
+                'pending',
+                'confirmed',
+                'preparing',
+                'ready',
+                'served',
+                'delivered',
+                'cancelled',
+                'completed',
+            ]
+
             if not new_status:
                 return Response({'error': 'Status is required'}, status=status.HTTP_400_BAD_REQUEST)
-            
+
             if new_status not in valid_statuses:
-                valid_str = ", ".join(valid_statuses)
-                return Response({'error': f'Invalid status. Valid statuses are: {valid_str}'}, status=status.HTTP_400_BAD_REQUEST)
-            
-            # Update order status
+                valid_str = ', '.join(valid_statuses)
+                return Response(
+                    {'error': f'Invalid status. Valid statuses are: {valid_str}'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            old_status = order_obj.status
+            if not order_transition_allowed(request.user, old_status, new_status):
+                return Response(
+                    {'error': 'You are not allowed to perform this status transition.'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            if new_status == 'preparing':
+                consume_stock_for_order(order_obj, request.user)
+            if new_status == 'cancelled':
+                reverse_stock_for_order(order_obj, request.user)
+
             order_obj.status = new_status
             order_obj.save()
             
-            print(f"✅ Order {order_obj.id} status updated to {new_status} by user {request.user.id if request.user.is_authenticated else 'anonymous'}")
+            print(
+                f"✅ Order {order_obj.id} status updated to {new_status} by user {request.user.id if request.user.is_authenticated else 'anonymous'}"
+            )
             
             # Emit Socket.IO event for order status update via HTTP request
             try:
@@ -748,6 +1048,39 @@ class OrderViewSet(viewsets.ModelViewSet):
             return Response({'error': str(ex), 'detail': error_trace}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'])
+    def assign_runner(self, request, pk=None):
+        """Kitchen assigns a waiter to deliver food for this order."""
+        order_obj = get_order_for_write_request(request, pk or request.data.get('order_id'))
+        staff_id = request.data.get('staff_id')
+        if not staff_id:
+            return Response({'error': 'staff_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        runner = get_object_or_404(
+            Staff,
+            id=int(staff_id),
+            restaurant_id=order_obj.restaurant_id,
+            employment_status='active',
+            is_active=True,
+        )
+        order_obj.assigned_runner = runner
+        order_obj.assigned_at = timezone.now()
+        order_obj.save(update_fields=['assigned_runner', 'assigned_at'])
+        try:
+            requests.post(
+                'http://localhost:8001/emit_order_update',
+                json={
+                    'order_id': order_obj.id,
+                    'status': order_obj.status,
+                    'user_type': 'staff',
+                    'assigned_runner_id': runner.id,
+                },
+                timeout=1,
+            )
+        except Exception as e:
+            print(f'❌ Socket.IO assign_runner emit failed: {e}')
+        serializer = self.get_serializer(order_obj)
+        return Response({'success': True, 'order': serializer.data}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
     def mark_paid(self, request, pk=None):
         """Mark an order as paid (typically cash/UPI at table)."""
         try:
@@ -757,17 +1090,7 @@ class OrderViewSet(viewsets.ModelViewSet):
             if not order_id:
                 return Response({'error': 'Order ID is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-            restaurant = getattr(request, 'restaurant', None)
-            if restaurant:
-                try:
-                    order_obj = order.objects.get(id=order_id, restaurant=restaurant)
-                except order.DoesNotExist:
-                    return Response({'error': 'Order not found or does not belong to this restaurant'}, status=status.HTTP_404_NOT_FOUND)
-            else:
-                try:
-                    order_obj = order.objects.get(id=order_id)
-                except order.DoesNotExist:
-                    return Response({'error': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
+            order_obj = get_order_for_write_request(request, order_id)
 
             if order_obj.payment_status == 'paid':
                 serializer = self.get_serializer(order_obj)
@@ -871,7 +1194,11 @@ class OrderViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def clear_table(self, request):
-        """Clear table by marking all orders as billed"""
+        """Clear table by marking all eligible orders as billed.
+
+        Only orders that are already paid/completed can be cleared.
+        If there are unpaid/active orders, return an error instead of silently clearing.
+        """
         table_unique_id = request.data.get('table_unique_id')
         room_unique_id = request.data.get('room_unique_id')
         
@@ -879,21 +1206,48 @@ class OrderViewSet(viewsets.ModelViewSet):
             return Response({'error': 'table_unique_id or room_unique_id is required'}, status=status.HTTP_400_BAD_REQUEST)
         
         try:
-            # Mark all orders for this table/room as billed
+            base_qs = order.objects.all()
             if table_unique_id:
-                orders_to_clear = order.objects.filter(table_unique_id=table_unique_id, bill_clear=False)
+                base_qs = base_qs.filter(table_unique_id=table_unique_id)
             else:
-                orders_to_clear = order.objects.filter(room_unique_id=room_unique_id, bill_clear=False)
-            
-            # Update all orders to mark them as billed
-            orders_to_clear.update(bill_clear=True)
-            
+                base_qs = base_qs.filter(room_unique_id=room_unique_id)
+
+            unpaid_orders = base_qs.filter(
+                bill_clear=False,
+                payment_status__in=['unpaid', 'pending_payment', 'failed', 'refunded'],
+            )
+            if unpaid_orders.exists():
+                ids = list(unpaid_orders.values_list('id', flat=True))
+                return Response(
+                    {
+                        'error': 'Cannot clear table while there are unpaid orders.',
+                        'unpaid_order_ids': ids,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Mark all paid/completed orders for this table/room as billed
+            if table_unique_id:
+                orders_to_clear = base_qs.filter(
+                    bill_clear=False,
+                    payment_status='paid',
+                )
+            else:
+                orders_to_clear = base_qs.filter(
+                    bill_clear=False,
+                    payment_status='paid',
+                )
+
             cleared_count = orders_to_clear.count()
-            
-            return Response({
-                'message': f'Table cleared successfully. {cleared_count} orders marked as billed.',
-                'cleared_orders': cleared_count
-            }, status=status.HTTP_200_OK)
+            orders_to_clear.update(bill_clear=True)
+
+            return Response(
+                {
+                    'message': f'Table cleared successfully. {cleared_count} orders marked as billed.',
+                    'cleared_orders': cleared_count,
+                },
+                status=status.HTTP_200_OK,
+            )
             
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -998,6 +1352,52 @@ class BillViewSet(viewsets.ReadOnlyModelViewSet):
 
 class AuthViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
+
+    def _serialize_auth_user(self, user, restaurant_slug=None):
+        serializer = UserSerializer(user)
+        data = serializer.data
+        data['role'] = user.role
+        role_permissions = RolePermission.objects.filter(role=user.role).select_related('permission')
+        data['permissions'] = [rp.permission.codename for rp in role_permissions]
+
+        if user.restaurant:
+            data['restaurant'] = RestaurantSerializer(user.restaurant).data
+        elif user.is_super_admin or user.is_superuser:
+            restaurants = Restaurant.objects.filter(is_active=True).order_by('name')
+            data['available_restaurants'] = RestaurantSerializer(restaurants, many=True).data
+            if restaurant_slug:
+                try:
+                    selected_restaurant = Restaurant.objects.get(slug=restaurant_slug, is_active=True)
+                    data['selected_restaurant'] = RestaurantSerializer(selected_restaurant).data
+                except Restaurant.DoesNotExist:
+                    pass
+        return data
+
+    def _verify_google_id_token(self, id_token):
+        response = requests.get(
+            'https://oauth2.googleapis.com/tokeninfo',
+            params={'id_token': id_token},
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        if payload.get('email_verified') not in ('true', True):
+            return None
+        return payload
+
+    def _generate_phone_from_sub(self, google_sub):
+        digits = ''.join(ch for ch in str(google_sub) if ch.isdigit()) or '0'
+        base = ('9' + digits[-9:].rjust(9, '0'))[:10]
+        if not User.objects.filter(phone=base).exists():
+            return base
+        try_num = int(base)
+        for _ in range(1000):
+            try_num = 9000000000 + ((try_num + 1) % 1000000000)
+            candidate = str(try_num)
+            if not User.objects.filter(phone=candidate).exists():
+                return candidate
+        raise ValueError('Unable to allocate phone number for Google signup')
     
     @action(detail=False, methods=['post'])
     def login(self, request):
@@ -1008,31 +1408,7 @@ class AuthViewSet(viewsets.ViewSet):
         user = authenticate(phone=phone, password=password)
         if user:
             login(request, user)
-            serializer = UserSerializer(user)
-            data = serializer.data
-            
-            # Add role and permissions
-            data['role'] = user.role
-            # Get permissions for the user's role
-            role_permissions = RolePermission.objects.filter(role=user.role).select_related('permission')
-            data['permissions'] = [rp.permission.codename for rp in role_permissions]
-            
-            # If user is a restaurant admin, include their restaurant
-            if user.restaurant:
-                data['restaurant'] = RestaurantSerializer(user.restaurant).data
-            # If user is super admin, include available restaurants
-            elif user.is_super_admin or user.is_superuser:
-                restaurants = Restaurant.objects.filter(is_active=True).order_by('name')
-                data['available_restaurants'] = RestaurantSerializer(restaurants, many=True).data
-                
-                # If restaurant_slug is provided, set it as the selected restaurant
-                if restaurant_slug:
-                    try:
-                        selected_restaurant = Restaurant.objects.get(slug=restaurant_slug, is_active=True)
-                        data['selected_restaurant'] = RestaurantSerializer(selected_restaurant).data
-                    except Restaurant.DoesNotExist:
-                        pass
-            
+            data = self._serialize_auth_user(user, restaurant_slug=restaurant_slug)
             return Response(data)
         return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
     
@@ -1059,6 +1435,67 @@ class AuthViewSet(viewsets.ViewSet):
         login(request, user)
         serializer = UserSerializer(user)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['post'])
+    def google_auth(self, request):
+        id_token = request.data.get('id_token')
+        mode = str(request.data.get('mode', 'login')).lower()
+        if not id_token:
+            return Response({'error': 'id_token is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if mode not in ('login', 'signup'):
+            return Response({'error': 'mode must be login or signup'}, status=status.HTTP_400_BAD_REQUEST)
+
+        google_payload = self._verify_google_id_token(id_token)
+        if not google_payload:
+            return Response({'error': 'Invalid Google token'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        google_sub = str(google_payload.get('sub', '')).strip()
+        google_email = str(google_payload.get('email', '')).strip().lower()
+        first_name = google_payload.get('given_name') or ''
+        last_name = google_payload.get('family_name') or ''
+        if not google_sub:
+            return Response({'error': 'Google token missing subject'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = User.objects.filter(Q(google_sub=google_sub) | Q(google_email=google_email)).first()
+
+        if mode == 'login' and not user:
+            return Response({'error': 'Google account not registered. Please sign up first.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if mode == 'signup' and not user:
+            phone = self._generate_phone_from_sub(google_sub)
+            user = User.objects.create_user(
+                phone=phone,
+                password=None,
+                first_name=first_name,
+                last_name=last_name,
+            )
+            user.set_unusable_password()
+            user.role = 'restaurant_admin'
+            user.cafe_manager = True
+            user.is_staff = True
+            user.google_sub = google_sub
+            user.google_email = google_email
+            user.save()
+        elif user:
+            changed = False
+            if not user.google_sub:
+                user.google_sub = google_sub
+                changed = True
+            if google_email and user.google_email != google_email:
+                user.google_email = google_email
+                changed = True
+            if first_name and not user.first_name:
+                user.first_name = first_name
+                changed = True
+            if last_name and not user.last_name:
+                user.last_name = last_name
+                changed = True
+            if changed:
+                user.save()
+
+        login(request, user)
+        data = self._serialize_auth_user(user)
+        return Response(data, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['post'])
     def create_hr_manager(self, request):
@@ -1201,59 +1638,169 @@ class AuthViewSet(viewsets.ViewSet):
 
 class DashboardViewSet(viewsets.ViewSet):
     permission_classes = [permissions.IsAuthenticated]
-    
+
+    def _resolve_restaurant(self, request):
+        return resolve_request_restaurant(request)
+
+    def _require_admin(self, request):
+        return request.user.is_superuser or request.user.cafe_manager or request.user.is_super_admin
+
     @action(detail=False, methods=['get'])
     def stats(self, request):
-        if not (request.user.is_superuser or request.user.cafe_manager or request.user.is_super_admin):
+        if not self._require_admin(request):
             return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
-        
-        # Filter by restaurant
-        restaurant = getattr(request, 'restaurant', None)
-        if not restaurant and request.user.is_authenticated and request.user.restaurant:
-            restaurant = request.user.restaurant
-        
+
+        restaurant = self._resolve_restaurant(request)
+
         if restaurant:
-            total_orders = order.objects.filter(restaurant=restaurant).count()
+            orders_qs = order.objects.filter(restaurant=restaurant)
+            bills_qs = bill.objects.filter(restaurant=restaurant)
             total_menu_items = menu_item.objects.filter(restaurant=restaurant, is_available=True).count()
             total_tables = Table.objects.filter(restaurant=restaurant, is_active=True).count()
-            total_revenue = sum(bill.bill_total for bill in bill.objects.filter(restaurant=restaurant))
-            recent_orders = order.objects.filter(restaurant=restaurant).order_by('-created_at')[:5]
-            menu_items = menu_item.objects.filter(restaurant=restaurant, is_available=True)[:5]
+            total_rooms = Room.objects.filter(restaurant=restaurant, is_active=True).count()
         else:
-            # Super admin can see all data
-            total_orders = order.objects.count()
+            orders_qs = order.objects.all()
+            bills_qs = bill.objects.all()
             total_menu_items = menu_item.objects.filter(is_available=True).count()
             total_tables = Table.objects.filter(is_active=True).count()
-            total_revenue = sum(bill.bill_total for bill in bill.objects.all())
-            recent_orders = order.objects.all().order_by('-created_at')[:5]
-            menu_items = menu_item.objects.filter(is_available=True)[:5]
-        
-        recent_orders_data = []
-        for order_obj in recent_orders:
-            recent_orders_data.append({
-                'id': order_obj.id,
-                'total_amount': order_obj.price,
-                'status': order_obj.status,
-                'table_unique_id': order_obj.table_unique_id
-            })
-        
-        # Get popular items (mock data for now)
-        popular_items = []
-        for item in menu_items:
-            popular_items.append({
-                'name': item.name,
-                'order_count': 0,  # This would need to be calculated from order history
-                'revenue': 0  # This would need to be calculated from order history
-            })
-        
+            total_rooms = Room.objects.filter(is_active=True).count()
+
+        total_orders = orders_qs.count()
+        total_revenue = float(sum((b.bill_total or Decimal('0')) for b in bills_qs))
+        paid_orders = orders_qs.filter(payment_status='paid').count()
+        pending_orders = orders_qs.filter(status__in=['pending', 'confirmed', 'preparing', 'ready', 'served']).count()
+
+        recent_orders_data = [
+            {
+                'id': o.id,
+                'total_amount': float(o.price or 0),
+                'price': float(o.price or 0),
+                'status': o.status,
+                'table_unique_id': o.table_unique_id,
+                'created_at': o.created_at,
+                'payment_status': o.payment_status,
+            }
+            for o in orders_qs.order_by('-created_at')[:8]
+        ]
+
         return Response({
             'total_orders': total_orders,
             'total_menu_items': total_menu_items,
             'total_tables': total_tables,
+            'total_rooms': total_rooms,
             'total_revenue': total_revenue,
+            'paid_orders': paid_orders,
+            'pending_orders': pending_orders,
             'recent_orders': recent_orders_data,
-            'popular_items': popular_items
         })
+
+    @action(detail=False, methods=['get'])
+    def analytics(self, request):
+        if not self._require_admin(request):
+            return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
+
+        restaurant = self._resolve_restaurant(request)
+        days = max(7, min(int(request.query_params.get('days', 14)), 90))
+        start_dt = timezone.now() - timedelta(days=days - 1)
+
+        if restaurant:
+            orders_qs = order.objects.filter(restaurant=restaurant, created_at__gte=start_dt).order_by('created_at')
+            bills_qs = bill.objects.filter(restaurant=restaurant, bill_time__gte=start_dt).order_by('bill_time')
+        else:
+            orders_qs = order.objects.filter(created_at__gte=start_dt).order_by('created_at')
+            bills_qs = bill.objects.filter(bill_time__gte=start_dt).order_by('bill_time')
+
+        day_keys = [(timezone.now() - timedelta(days=i)).date() for i in range(days - 1, -1, -1)]
+        labels = [d.strftime('%d %b') for d in day_keys]
+        orders_by_day = {d: 0 for d in day_keys}
+        revenue_by_day = {d: 0.0 for d in day_keys}
+
+        for o in orders_qs:
+            key = o.created_at.date()
+            if key in orders_by_day:
+                orders_by_day[key] += 1
+
+        for b_obj in bills_qs:
+            key = b_obj.bill_time.date()
+            if key in revenue_by_day:
+                revenue_by_day[key] += float(b_obj.bill_total or 0)
+
+        status_rows = orders_qs.values('status').annotate(count=Count('id'))
+        status_counts = {row['status']: row['count'] for row in status_rows}
+
+        item_stats = {}
+        for o in orders_qs:
+            try:
+                items = json.loads(o.items_json or '{}')
+            except (TypeError, ValueError):
+                items = {}
+            for _, payload in items.items():
+                qty = int(payload[0]) if len(payload) > 0 else 0
+                name = str(payload[1]) if len(payload) > 1 else 'Unknown'
+                unit_price = Decimal(str(payload[2])) if len(payload) > 2 else Decimal('0')
+                if name not in item_stats:
+                    item_stats[name] = {'quantity': 0, 'revenue': Decimal('0')}
+                item_stats[name]['quantity'] += qty
+                item_stats[name]['revenue'] += unit_price * qty
+
+        top_items = sorted(
+            [
+                {'name': k, 'quantity': v['quantity'], 'revenue': float(v['revenue'])}
+                for k, v in item_stats.items()
+            ],
+            key=lambda x: x['revenue'],
+            reverse=True
+        )[:8]
+
+        return Response({
+            'days': days,
+            'labels': labels,
+            'orders_series': [orders_by_day[d] for d in day_keys],
+            'revenue_series': [round(revenue_by_day[d], 2) for d in day_keys],
+            'status_counts': status_counts,
+            'top_items': top_items,
+        })
+
+    @action(detail=False, methods=['get', 'patch'])
+    def billing_config(self, request):
+        if not self._require_admin(request):
+            return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
+
+        restaurant = self._resolve_restaurant(request)
+        if not restaurant:
+            return Response({'error': 'Restaurant context is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        settings_dict = restaurant.settings or {}
+        existing = settings_dict.get('billing', {})
+        default_cfg = {
+            'currency': existing.get('currency', 'INR'),
+            'vat_enabled': existing.get('vat_enabled', True),
+            'vat_percent': float(existing.get('vat_percent', 5.0)),
+            'service_charge_enabled': existing.get('service_charge_enabled', False),
+            'service_charge_percent': float(existing.get('service_charge_percent', 0.0)),
+            'display_tax_breakdown': existing.get('display_tax_breakdown', True),
+        }
+
+        if request.method.lower() == 'get':
+            return Response(default_cfg)
+
+        payload = request.data or {}
+        updated = {
+            'currency': str(payload.get('currency', default_cfg['currency'])).upper(),
+            'vat_enabled': bool(payload.get('vat_enabled', default_cfg['vat_enabled'])),
+            'vat_percent': max(0.0, min(float(payload.get('vat_percent', default_cfg['vat_percent'])), 50.0)),
+            'service_charge_enabled': bool(payload.get('service_charge_enabled', default_cfg['service_charge_enabled'])),
+            'service_charge_percent': max(
+                0.0, min(float(payload.get('service_charge_percent', default_cfg['service_charge_percent'])), 30.0)
+            ),
+            'display_tax_breakdown': bool(
+                payload.get('display_tax_breakdown', default_cfg['display_tax_breakdown'])
+            ),
+        }
+        settings_dict['billing'] = updated
+        restaurant.settings = settings_dict
+        restaurant.save(update_fields=['settings', 'updated_at'])
+        return Response(updated)
 
 
 class SuperAdminDashboardViewSet(viewsets.ViewSet):
@@ -1281,11 +1828,20 @@ class SuperAdminDashboardViewSet(viewsets.ViewSet):
                 'menu_items_count': menu_item.objects.filter(restaurant=restaurant, is_available=True).count(),
             })
         
+        risk_tenants = Restaurant.objects.filter(
+            Q(subscription_status__in=['suspended', 'cancelled']) | Q(lifecycle_status__in=['archived', 'terminated'])
+        ).count()
+        failed_payments = BillingInvoice.objects.filter(status='failed').count()
+        module_blocks = PlatformAuditLog.objects.filter(action='module_blocked').count()
+
         return Response({
             'total_restaurants': total_restaurants,
             'total_orders': total_orders,
             'total_revenue': total_revenue,
-            'restaurants': restaurant_stats
+            'restaurants': restaurant_stats,
+            'risk_tenants': risk_tenants,
+            'failed_payments': failed_payments,
+            'module_blocked_attempts': module_blocks,
         })
     
     @action(detail=False, methods=['get'])
@@ -1319,6 +1875,406 @@ class SuperAdminDashboardViewSet(viewsets.ViewSet):
         
         return Response(analytics_data)
 
+    @action(detail=False, methods=['get'])
+    def tenants(self, request):
+        restaurants = Restaurant.objects.all().order_by('-created_at')
+        payload = []
+        for restaurant in restaurants:
+            active_sub = (
+                RestaurantSubscription.objects.filter(restaurant=restaurant, is_active=True)
+                .select_related('plan')
+                .order_by('-created_at')
+                .first()
+            )
+            payload.append(
+                {
+                    'id': restaurant.id,
+                    'name': restaurant.name,
+                    'slug': restaurant.slug,
+                    'is_active': restaurant.is_active,
+                    'subscription_status': restaurant.subscription_status,
+                    'lifecycle_status': restaurant.lifecycle_status,
+                    'archived_at': restaurant.archived_at,
+                    'terminated_at': restaurant.terminated_at,
+                    'plan': (
+                        {
+                            'id': active_sub.plan.id,
+                            'code': active_sub.plan.code,
+                            'name': active_sub.plan.name,
+                            'max_monthly_orders': active_sub.plan.max_monthly_orders,
+                            'max_staff': active_sub.plan.max_staff,
+                            'max_tables': getattr(active_sub.plan, 'max_tables', 50),
+                        }
+                        if active_sub
+                        else None
+                    ),
+                    'orders_count': order.objects.filter(restaurant=restaurant).count(),
+                    'staff_count': Staff.objects.filter(restaurant=restaurant, is_active=True).count(),
+                    'tables_count': Table.objects.filter(restaurant=restaurant, is_active=True).count(),
+                }
+            )
+        return Response(payload)
+
+    @action(detail=True, methods=['post'])
+    def assign_plan(self, request, pk=None):
+        restaurant = get_object_or_404(Restaurant, id=pk)
+        plan_id = request.data.get('plan_id')
+        status_value = request.data.get('status', 'active')
+        plan = get_object_or_404(SubscriptionPlan, id=plan_id, is_active=True)
+        before_state = {
+            'active_subscription': (
+                RestaurantSubscription.objects.filter(restaurant=restaurant, is_active=True)
+                .values('id', 'plan_id', 'status')
+                .first()
+            ),
+            'subscription_status': restaurant.subscription_status,
+        }
+
+        with transaction.atomic():
+            RestaurantSubscription.objects.filter(
+                restaurant=restaurant,
+                is_active=True,
+            ).update(is_active=False, status='cancelled')
+
+            new_sub = RestaurantSubscription.objects.create(
+                restaurant=restaurant,
+                plan=plan,
+                status=status_value,
+                is_active=True,
+                current_period_start=timezone.now(),
+                current_period_end=timezone.now() + timedelta(days=30),
+                metadata={'assigned_by': request.user.phone},
+            )
+
+            restaurant.subscription_status = 'active' if status_value in ('active', 'trialing') else status_value
+            if status_value == 'suspended':
+                restaurant.is_active = False
+                restaurant.lifecycle_status = 'suspended'
+            elif status_value in ('active', 'trialing'):
+                restaurant.is_active = True
+                restaurant.lifecycle_status = 'active'
+            restaurant.save(update_fields=['subscription_status', 'is_active', 'lifecycle_status', 'updated_at'])
+
+            BillingInvoice.objects.create(
+                restaurant=restaurant,
+                subscription=new_sub,
+                plan=plan,
+                invoice_number=f"INV-{restaurant.id}-{int(timezone.now().timestamp())}",
+                amount=plan.price,
+                currency=plan.currency,
+                due_date=timezone.now() + timedelta(days=7),
+                status='pending_payment' if status_value in ('active', 'trialing') else 'void',
+                metadata={'source': 'super_admin_assign_plan'},
+            )
+
+        log_platform_action(
+            actor=request.user,
+            action='plan_assign',
+            restaurant=restaurant,
+            target_type='subscription',
+            target_id=new_sub.id,
+            before_state=before_state,
+            after_state={'subscription_id': new_sub.id, 'plan_id': plan.id, 'status': new_sub.status},
+        )
+
+        return Response(RestaurantSubscriptionSerializer(new_sub).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'])
+    def suspend_tenant(self, request, pk=None):
+        restaurant = get_object_or_404(Restaurant, id=pk)
+        before_state = {
+            'is_active': restaurant.is_active,
+            'subscription_status': restaurant.subscription_status,
+            'lifecycle_status': restaurant.lifecycle_status,
+        }
+        restaurant.is_active = False
+        restaurant.subscription_status = 'suspended'
+        restaurant.lifecycle_status = 'suspended'
+        restaurant.save(update_fields=['is_active', 'subscription_status', 'lifecycle_status', 'updated_at'])
+        RestaurantSubscription.objects.filter(restaurant=restaurant, is_active=True).update(
+            status='suspended',
+        )
+        log_platform_action(
+            actor=request.user,
+            action='tenant_suspend',
+            restaurant=restaurant,
+            target_type='restaurant',
+            target_id=restaurant.id,
+            before_state=before_state,
+            after_state={
+                'is_active': restaurant.is_active,
+                'subscription_status': restaurant.subscription_status,
+                'lifecycle_status': restaurant.lifecycle_status,
+            },
+        )
+        return Response({'id': restaurant.id, 'status': 'suspended'})
+
+    @action(detail=True, methods=['post'])
+    def reactivate_tenant(self, request, pk=None):
+        restaurant = get_object_or_404(Restaurant, id=pk)
+        before_state = {
+            'is_active': restaurant.is_active,
+            'subscription_status': restaurant.subscription_status,
+            'lifecycle_status': restaurant.lifecycle_status,
+        }
+        restaurant.is_active = True
+        restaurant.subscription_status = 'active'
+        restaurant.lifecycle_status = 'active'
+        restaurant.archived_at = None
+        restaurant.save(update_fields=['is_active', 'subscription_status', 'lifecycle_status', 'archived_at', 'updated_at'])
+        RestaurantSubscription.objects.filter(restaurant=restaurant, is_active=True).update(
+            status='active',
+        )
+        log_platform_action(
+            actor=request.user,
+            action='tenant_reactivate',
+            restaurant=restaurant,
+            target_type='restaurant',
+            target_id=restaurant.id,
+            before_state=before_state,
+            after_state={
+                'is_active': restaurant.is_active,
+                'subscription_status': restaurant.subscription_status,
+                'lifecycle_status': restaurant.lifecycle_status,
+            },
+        )
+        return Response({'id': restaurant.id, 'status': 'active'})
+
+    @action(detail=True, methods=['post'])
+    def archive_tenant(self, request, pk=None):
+        restaurant = get_object_or_404(Restaurant, id=pk)
+        before_state = {
+            'is_active': restaurant.is_active,
+            'subscription_status': restaurant.subscription_status,
+            'lifecycle_status': restaurant.lifecycle_status,
+            'archived_at': restaurant.archived_at,
+        }
+        restaurant.is_active = False
+        restaurant.subscription_status = 'suspended'
+        restaurant.lifecycle_status = 'archived'
+        restaurant.archived_at = timezone.now()
+        restaurant.save(update_fields=['is_active', 'subscription_status', 'lifecycle_status', 'archived_at', 'updated_at'])
+        RestaurantSubscription.objects.filter(restaurant=restaurant, is_active=True).update(status='suspended')
+        log_platform_action(
+            actor=request.user,
+            action='tenant_archive',
+            restaurant=restaurant,
+            target_type='restaurant',
+            target_id=restaurant.id,
+            before_state=before_state,
+            after_state={
+                'is_active': restaurant.is_active,
+                'subscription_status': restaurant.subscription_status,
+                'lifecycle_status': restaurant.lifecycle_status,
+                'archived_at': restaurant.archived_at.isoformat() if restaurant.archived_at else None,
+            },
+        )
+        return Response({'id': restaurant.id, 'status': 'archived'})
+
+    @action(detail=True, methods=['post'])
+    def restore_tenant(self, request, pk=None):
+        restaurant = get_object_or_404(Restaurant, id=pk)
+        before_state = {
+            'is_active': restaurant.is_active,
+            'subscription_status': restaurant.subscription_status,
+            'lifecycle_status': restaurant.lifecycle_status,
+            'archived_at': restaurant.archived_at,
+        }
+        restaurant.is_active = True
+        restaurant.subscription_status = 'active'
+        restaurant.lifecycle_status = 'active'
+        restaurant.archived_at = None
+        restaurant.save(update_fields=['is_active', 'subscription_status', 'lifecycle_status', 'archived_at', 'updated_at'])
+        RestaurantSubscription.objects.filter(restaurant=restaurant, is_active=True).update(status='active')
+        log_platform_action(
+            actor=request.user,
+            action='tenant_restore',
+            restaurant=restaurant,
+            target_type='restaurant',
+            target_id=restaurant.id,
+            before_state=before_state,
+            after_state={
+                'is_active': restaurant.is_active,
+                'subscription_status': restaurant.subscription_status,
+                'lifecycle_status': restaurant.lifecycle_status,
+                'archived_at': restaurant.archived_at,
+            },
+        )
+        return Response({'id': restaurant.id, 'status': 'active'})
+
+    @action(detail=True, methods=['post'])
+    def terminate_tenant(self, request, pk=None):
+        restaurant = get_object_or_404(Restaurant, id=pk)
+        before_state = {
+            'is_active': restaurant.is_active,
+            'subscription_status': restaurant.subscription_status,
+            'lifecycle_status': restaurant.lifecycle_status,
+            'terminated_at': restaurant.terminated_at,
+        }
+        restaurant.is_active = False
+        restaurant.subscription_status = 'cancelled'
+        restaurant.lifecycle_status = 'terminated'
+        restaurant.terminated_at = timezone.now()
+        restaurant.save(update_fields=['is_active', 'subscription_status', 'lifecycle_status', 'terminated_at', 'updated_at'])
+        RestaurantSubscription.objects.filter(restaurant=restaurant, is_active=True).update(status='cancelled', is_active=False)
+        log_platform_action(
+            actor=request.user,
+            action='tenant_terminate',
+            restaurant=restaurant,
+            target_type='restaurant',
+            target_id=restaurant.id,
+            before_state=before_state,
+            after_state={
+                'is_active': restaurant.is_active,
+                'subscription_status': restaurant.subscription_status,
+                'lifecycle_status': restaurant.lifecycle_status,
+                'terminated_at': restaurant.terminated_at.isoformat() if restaurant.terminated_at else None,
+            },
+        )
+        return Response({'id': restaurant.id, 'status': 'terminated'})
+
+    @action(detail=False, methods=['get'])
+    def users(self, request):
+        users = User.objects.select_related('restaurant').order_by('-id')[:500]
+        payload = []
+        for user in users:
+            payload.append(
+                {
+                    'id': user.id,
+                    'phone': user.phone,
+                    'first_name': user.first_name,
+                    'last_name': user.last_name,
+                    'role': user.role,
+                    'is_super_admin': user.is_super_admin,
+                    'is_superuser': user.is_superuser,
+                    'cafe_manager': user.cafe_manager,
+                    'restaurant': (
+                        {
+                            'id': user.restaurant.id,
+                            'name': user.restaurant.name,
+                            'slug': user.restaurant.slug,
+                        }
+                        if user.restaurant
+                        else None
+                    ),
+                }
+            )
+        return Response(payload)
+
+    @action(detail=False, methods=['get'])
+    def logs(self, request):
+        logs = PlatformAuditLog.objects.select_related('actor', 'restaurant').order_by('-created_at')[:200]
+        payload = [
+            {
+                'id': item.id,
+                'timestamp': item.created_at,
+                'user': item.actor.phone if item.actor else 'system',
+                'action_flag': 1,
+                'object_repr': f"{item.action}::{item.target_type}:{item.target_id}",
+                'change_message': json.dumps(item.metadata or {}),
+            }
+            for item in logs
+        ]
+        return Response(payload)
+
+    @action(detail=False, methods=['post'])
+    def force_logout_user(self, request):
+        user_id = request.data.get('user_id')
+        if not user_id:
+            return Response({'error': 'user_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        target_user = get_object_or_404(User, id=user_id)
+        removed = 0
+        for session in Session.objects.all():
+            data = session.get_decoded()
+            if str(data.get('_auth_user_id')) == str(target_user.id):
+                session.delete()
+                removed += 1
+        log_platform_action(
+            actor=request.user,
+            action='force_logout_user',
+            restaurant=target_user.restaurant,
+            target_type='user',
+            target_id=target_user.id,
+            after_state={'removed_sessions': removed},
+        )
+        return Response({'user_id': target_user.id, 'removed_sessions': removed})
+
+    @action(detail=False, methods=['get', 'post'])
+    def notifications(self, request):
+        if request.method.lower() == 'get':
+            rows = []
+            for restaurant in Restaurant.objects.all().order_by('name'):
+                settings_dict = restaurant.settings or {}
+                notices = settings_dict.get('super_admin_notifications', [])
+                for notice in notices[-5:]:
+                    rows.append(
+                        {
+                            'restaurant_id': restaurant.id,
+                            'restaurant_name': restaurant.name,
+                            'title': notice.get('title', ''),
+                            'message': notice.get('message', ''),
+                            'created_at': notice.get('created_at'),
+                        }
+                    )
+            rows.sort(key=lambda n: n.get('created_at') or '', reverse=True)
+            return Response(rows[:200])
+
+        title = str(request.data.get('title', '')).strip()
+        message = str(request.data.get('message', '')).strip()
+        if not title or not message:
+            return Response({'error': 'title and message are required'}, status=status.HTTP_400_BAD_REQUEST)
+        target_restaurant_id = request.data.get('restaurant_id')
+        now_iso = timezone.now().isoformat()
+        target_qs = Restaurant.objects.all()
+        if target_restaurant_id:
+            target_qs = target_qs.filter(id=target_restaurant_id)
+        updated = 0
+        for restaurant in target_qs:
+            settings_dict = restaurant.settings or {}
+            notices = settings_dict.get('super_admin_notifications', [])
+            notices.append({'title': title, 'message': message, 'created_at': now_iso, 'created_by': request.user.phone})
+            settings_dict['super_admin_notifications'] = notices[-50:]
+            restaurant.settings = settings_dict
+            restaurant.save(update_fields=['settings', 'updated_at'])
+            updated += 1
+        return Response({'updated_restaurants': updated})
+
+    @action(detail=False, methods=['get'])
+    def support(self, request):
+        rows = []
+        for restaurant in Restaurant.objects.all().order_by('name'):
+            active_sub = (
+                RestaurantSubscription.objects.filter(restaurant=restaurant, is_active=True)
+                .select_related('plan')
+                .order_by('-created_at')
+                .first()
+            )
+            rows.append(
+                {
+                    'restaurant_id': restaurant.id,
+                    'name': restaurant.name,
+                    'slug': restaurant.slug,
+                    'is_active': restaurant.is_active,
+                    'subscription_status': restaurant.subscription_status,
+                    'contact_phone': restaurant.phone,
+                    'contact_email': restaurant.email,
+                    'plan_name': active_sub.plan.name if active_sub else None,
+                    'open_invoices': BillingInvoice.objects.filter(
+                        restaurant=restaurant,
+                        status__in=['pending_payment', 'failed'],
+                    ).count(),
+                    'last_audit_at': (
+                        PlatformAuditLog.objects.filter(restaurant=restaurant)
+                        .order_by('-created_at')
+                        .values_list('created_at', flat=True)
+                        .first()
+                    ),
+                    'needs_attention': (not restaurant.is_active) or (restaurant.subscription_status in ['suspended', 'cancelled']),
+                }
+            )
+        rows.sort(key=lambda r: (not r['needs_attention'], r['name']))
+        return Response(rows)
+
 
 class DepartmentViewSet(viewsets.ModelViewSet):
     queryset = Department.objects.all().order_by('name')
@@ -1333,13 +2289,13 @@ class DepartmentViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_authenticated and (user.is_superuser or user.cafe_manager):
-            return Department.objects.all().order_by('name')
-        return Department.objects.filter(is_active=True).order_by('name')
+            return tenant_scoped_queryset(Department.objects.all(), self.request).order_by('name')
+        return tenant_scoped_queryset(Department.objects.filter(is_active=True), self.request).order_by('name')
 
     def perform_create(self, serializer):
         if not (self.request.user.is_superuser or self.request.user.cafe_manager):
             raise PermissionDenied("Only administrators can create departments")
-        serializer.save()
+        serializer.save(restaurant=resolve_request_restaurant(self.request))
 
     def perform_update(self, serializer):
         if not (self.request.user.is_superuser or self.request.user.cafe_manager):
@@ -1364,13 +2320,13 @@ class RoleViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_authenticated and (user.is_superuser or user.cafe_manager):
-            return Role.objects.all().order_by('department', 'name')
-        return Role.objects.filter(is_active=True).order_by('department', 'name')
+            return tenant_scoped_queryset(Role.objects.all(), self.request).order_by('department', 'name')
+        return tenant_scoped_queryset(Role.objects.filter(is_active=True), self.request).order_by('department', 'name')
 
     def perform_create(self, serializer):
         if not (self.request.user.is_superuser or self.request.user.cafe_manager):
             raise PermissionDenied("Only administrators can create roles")
-        serializer.save()
+        serializer.save(restaurant=resolve_request_restaurant(self.request))
 
     def perform_update(self, serializer):
         if not (self.request.user.is_superuser or self.request.user.cafe_manager):
@@ -1386,7 +2342,7 @@ class RoleViewSet(viewsets.ModelViewSet):
     def by_department(self, request):
         department_id = request.query_params.get('department')
         if department_id:
-            roles = Role.objects.filter(department_id=department_id).order_by('name')
+            roles = tenant_scoped_queryset(Role.objects.filter(department_id=department_id), request).order_by('name')
             serializer = self.get_serializer(roles, many=True)
             return Response(serializer.data)
         return Response({'error': 'Department parameter required'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1409,13 +2365,13 @@ class StaffViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_authenticated and (user.is_superuser or user.cafe_manager):
-            return Staff.objects.all().order_by('employee_id')
-        return Staff.objects.filter(is_active=True).order_by('employee_id')
+            return tenant_scoped_queryset(Staff.objects.all(), self.request).order_by('employee_id')
+        return tenant_scoped_queryset(Staff.objects.filter(is_active=True), self.request).order_by('employee_id')
 
     def perform_create(self, serializer):
         if not (self.request.user.is_superuser or self.request.user.cafe_manager):
             raise PermissionDenied("Only administrators can create staff")
-        serializer.save()
+        serializer.save(restaurant=resolve_request_restaurant(self.request))
 
     def perform_update(self, serializer):
         if not (self.request.user.is_superuser or self.request.user.cafe_manager):
@@ -1431,14 +2387,19 @@ class StaffViewSet(viewsets.ModelViewSet):
     def by_department(self, request):
         department_id = request.query_params.get('department')
         if department_id:
-            staff = Staff.objects.filter(department_id=department_id).order_by('employee_id')
+            staff = tenant_scoped_queryset(Staff.objects.filter(department_id=department_id), request).order_by('employee_id')
             serializer = self.get_serializer(staff, many=True)
             return Response(serializer.data)
         return Response({'error': 'Department parameter required'}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=False, methods=['get'])
     def active_staff(self, request):
-        staff = Staff.objects.filter(employment_status='active', is_active=True).order_by('employee_id')
+        staff = tenant_scoped_queryset(
+            Staff.objects.filter(employment_status='active', is_active=True),
+            request
+        ).order_by('employee_id')
+        if request.query_params.get('waiters_only'):
+            staff = staff.filter(user__groups__name='waiter').distinct()
         serializer = self.get_serializer(staff, many=True)
         return Response(serializer.data)
 
@@ -1465,8 +2426,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_authenticated and (user.is_superuser or user.cafe_manager):
-            return Attendance.objects.all().order_by('-date', '-created_at')
-        # Staff can only see their own attendance
+            return tenant_scoped_queryset(Attendance.objects.all(), self.request).order_by('-date', '-created_at')
+        if hasattr(user, 'employee_profile'):
+            return Attendance.objects.filter(employee=user.employee_profile).order_by('-date', '-created_at')
         if hasattr(user, 'staff_profile'):
             return Attendance.objects.filter(staff=user.staff_profile).order_by('-date', '-created_at')
         return Attendance.objects.none()
@@ -1503,32 +2465,43 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def check_in(self, request):
-        if not hasattr(request.user, 'staff_profile'):
-            return Response({'error': 'Staff profile not found'}, status=status.HTTP_400_BAD_REQUEST)
-        
+        user = request.user
         today = date.today()
-        attendance, created = Attendance.objects.get_or_create(
-            staff=request.user.staff_profile,
-            date=today,
-            defaults={'check_in_time': timezone.now().time(), 'status': 'present'}
-        )
-        
+        if hasattr(user, 'employee_profile'):
+            emp = user.employee_profile
+            attendance, created = Attendance.objects.get_or_create(
+                employee=emp,
+                date=today,
+                defaults={'check_in_time': timezone.now().time(), 'status': 'present'},
+            )
+        elif hasattr(user, 'staff_profile'):
+            attendance, created = Attendance.objects.get_or_create(
+                staff=user.staff_profile,
+                date=today,
+                defaults={'check_in_time': timezone.now().time(), 'status': 'present'},
+            )
+        else:
+            return Response({'error': 'Staff or employee profile not found'}, status=status.HTTP_400_BAD_REQUEST)
+
         if not created:
             attendance.check_in_time = timezone.now().time()
             attendance.status = 'present'
             attendance.save()
-        
+
         serializer = self.get_serializer(attendance)
         return Response(serializer.data)
 
     @action(detail=False, methods=['post'])
     def check_out(self, request):
-        if not hasattr(request.user, 'staff_profile'):
-            return Response({'error': 'Staff profile not found'}, status=status.HTTP_400_BAD_REQUEST)
-        
+        user = request.user
         today = date.today()
         try:
-            attendance = Attendance.objects.get(staff=request.user.staff_profile, date=today)
+            if hasattr(user, 'employee_profile'):
+                attendance = Attendance.objects.get(employee=user.employee_profile, date=today)
+            elif hasattr(user, 'staff_profile'):
+                attendance = Attendance.objects.get(staff=user.staff_profile, date=today)
+            else:
+                return Response({'error': 'Staff or employee profile not found'}, status=status.HTTP_400_BAD_REQUEST)
             attendance.check_out_time = timezone.now().time()
             attendance.save()
             serializer = self.get_serializer(attendance)
@@ -1544,8 +2517,9 @@ class LeaveViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_authenticated and (user.is_superuser or user.cafe_manager):
-            return Leave.objects.all().order_by('-start_date')
-        # Staff can only see their own leaves
+            return tenant_scoped_queryset(Leave.objects.all(), self.request).order_by('-start_date')
+        if hasattr(user, 'employee_profile'):
+            return Leave.objects.filter(employee=user.employee_profile).order_by('-start_date')
         if hasattr(user, 'staff_profile'):
             return Leave.objects.filter(staff=user.staff_profile).order_by('-start_date')
         return Leave.objects.none()
@@ -2153,3 +3127,158 @@ class TrainingEnrollmentViewSet(viewsets.ModelViewSet):
         enrollment.save()
         serializer = self.get_serializer(enrollment)
         return Response(serializer.data)
+
+
+class SubscriptionPlanViewSet(viewsets.ModelViewSet):
+    queryset = SubscriptionPlan.objects.all().order_by('name')
+    serializer_class = SubscriptionPlanSerializer
+    permission_classes = [IsSuperAdmin]
+
+
+class RestaurantSubscriptionViewSet(viewsets.ModelViewSet):
+    queryset = RestaurantSubscription.objects.select_related('restaurant', 'plan').all()
+    serializer_class = RestaurantSubscriptionSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if self.request.user.is_super_admin or self.request.user.is_superuser:
+            restaurant_id = self.request.query_params.get('restaurant_id')
+            if restaurant_id:
+                qs = qs.filter(restaurant_id=restaurant_id)
+            return qs
+        return tenant_scoped_queryset(qs, self.request)
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve', 'current', 'usage']:
+            return [permissions.IsAuthenticated()]
+        if self.request.user.is_super_admin or self.request.user.is_superuser:
+            return [permissions.IsAuthenticated()]
+        return [permissions.IsAuthenticated()]
+
+    @action(detail=False, methods=['get'])
+    def current(self, request):
+        restaurant = resolve_request_restaurant(request)
+        if not restaurant and not (request.user.is_super_admin or request.user.is_superuser):
+            return Response({'error': 'Restaurant context is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if request.user.is_super_admin or request.user.is_superuser:
+            restaurant_id = request.query_params.get('restaurant_id')
+            if restaurant_id:
+                restaurant = get_object_or_404(Restaurant, id=restaurant_id)
+        if not restaurant:
+            return Response({'error': 'Restaurant not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        current = (
+            RestaurantSubscription.objects.filter(restaurant=restaurant, is_active=True)
+            .select_related('plan')
+            .order_by('-created_at')
+            .first()
+        )
+        if not current:
+            return Response({'restaurant_id': restaurant.id, 'subscription': None})
+        return Response({'restaurant_id': restaurant.id, 'subscription': self.get_serializer(current).data})
+
+    @action(detail=False, methods=['get'])
+    def usage(self, request):
+        restaurant = resolve_request_restaurant(request)
+        if request.user.is_super_admin or request.user.is_superuser:
+            restaurant_id = request.query_params.get('restaurant_id')
+            if restaurant_id:
+                restaurant = get_object_or_404(Restaurant, id=restaurant_id)
+        if not restaurant:
+            return Response({'error': 'Restaurant context is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        month_key = timezone.now().strftime('%Y-%m')
+        orders_count = order.objects.filter(restaurant=restaurant, created_at__startswith=month_key).count()
+        active_staff_count = Staff.objects.filter(restaurant=restaurant, is_active=True).count()
+        snap, _ = TenantUsageSnapshot.objects.update_or_create(
+            restaurant=restaurant,
+            month_key=month_key,
+            defaults={'orders_count': orders_count, 'active_staff_count': active_staff_count},
+        )
+        serializer = TenantUsageSnapshotSerializer(snap)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def billing_summary(self, request):
+        restaurant = resolve_request_restaurant(request)
+        if request.user.is_super_admin or request.user.is_superuser:
+            restaurant_id = request.query_params.get('restaurant_id')
+            if restaurant_id:
+                restaurant = get_object_or_404(Restaurant, id=restaurant_id)
+        if not restaurant:
+            return Response({'error': 'Restaurant context is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        invoices = BillingInvoice.objects.filter(restaurant=restaurant).order_by('-created_at')[:20]
+        active_sub = restaurant.active_subscription
+        return Response(
+            {
+                'restaurant_id': restaurant.id,
+                'subscription': RestaurantSubscriptionSerializer(active_sub).data if active_sub else None,
+                'invoices': BillingInvoiceSerializer(invoices, many=True).data,
+            }
+        )
+
+    @action(detail=True, methods=['post'])
+    def pay_now(self, request, pk=None):
+        sub = self.get_object()
+        if not (request.user.is_super_admin or request.user.is_superuser):
+            restaurant = resolve_request_restaurant(request)
+            if not restaurant or restaurant.id != sub.restaurant_id:
+                return Response({'error': 'Restaurant context is required'}, status=status.HTTP_403_FORBIDDEN)
+
+        invoice = BillingInvoice.objects.filter(subscription=sub).order_by('-created_at').first()
+        if not invoice:
+            invoice = BillingInvoice.objects.create(
+                restaurant=sub.restaurant,
+                subscription=sub,
+                plan=sub.plan,
+                invoice_number=f"INV-{sub.restaurant_id}-{int(timezone.now().timestamp())}",
+                amount=sub.plan.price,
+                currency=sub.plan.currency,
+                due_date=timezone.now() + timedelta(days=7),
+                status='pending_payment',
+                metadata={'source': 'pay_now_action'},
+            )
+        provider = EsewaBillingProvider()
+        init = provider.initiate_payment(
+            invoice=invoice,
+            success_url=request.data.get('success_url', ''),
+            failure_url=request.data.get('failure_url', ''),
+        )
+        tx = BillingTransaction.objects.create(
+            invoice=invoice,
+            gateway='esewa',
+            status='initiated',
+            gateway_reference=init['transaction_ref'],
+            request_payload=init['payload'],
+        )
+        return Response({'invoice': BillingInvoiceSerializer(invoice).data, 'transaction': BillingTransactionSerializer(tx).data})
+
+    @action(detail=False, methods=['post'])
+    def verify_payment(self, request):
+        tx_id = request.data.get('transaction_id')
+        tx = get_object_or_404(BillingTransaction.objects.select_related('invoice', 'invoice__subscription'), id=tx_id)
+        provider = EsewaBillingProvider()
+        result = provider.verify_payment(transaction=tx, payload=request.data)
+        if result['success']:
+            tx.status = 'success'
+            tx.response_payload = request.data
+            tx.save(update_fields=['status', 'response_payload', 'updated_at'])
+            tx.invoice.status = 'paid'
+            tx.invoice.save(update_fields=['status', 'updated_at'])
+            sub = tx.invoice.subscription
+            if sub:
+                sub.status = 'active'
+                sub.save(update_fields=['status', 'updated_at'])
+                sub.restaurant.subscription_status = 'active'
+                sub.restaurant.is_active = True
+                sub.restaurant.lifecycle_status = 'active'
+                sub.restaurant.save(update_fields=['subscription_status', 'is_active', 'lifecycle_status', 'updated_at'])
+        else:
+            tx.status = 'failed'
+            tx.response_payload = request.data
+            tx.save(update_fields=['status', 'response_payload', 'updated_at'])
+            tx.invoice.status = 'failed'
+            tx.invoice.save(update_fields=['status', 'updated_at'])
+        return Response({'transaction': BillingTransactionSerializer(tx).data})

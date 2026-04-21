@@ -29,11 +29,38 @@ class Restaurant(models.Model):
     is_active = models.BooleanField(default=True)
     subscription_status = models.CharField(max_length=20, choices=SUBSCRIPTION_STATUS_CHOICES, default='active')
     settings = models.JSONField(default=dict, blank=True, help_text="Restaurant-specific configuration")
+    archived_at = models.DateTimeField(blank=True, null=True)
+    terminated_at = models.DateTimeField(blank=True, null=True)
+    lifecycle_status = models.CharField(
+        max_length=20,
+        choices=[
+            ('active', 'Active'),
+            ('suspended', 'Suspended'),
+            ('archived', 'Archived'),
+            ('terminated', 'Terminated'),
+        ],
+        default='active',
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
     def __str__(self):
         return self.name
+
+    @property
+    def active_subscription(self):
+        return self.subscriptions.filter(is_active=True).order_by('-created_at').first()
+
+    @property
+    def tenant_is_active(self) -> bool:
+        if not self.is_active:
+            return False
+        if self.subscription_status in ('suspended', 'cancelled'):
+            return False
+        sub = self.active_subscription
+        if not sub:
+            return self.subscription_status in ('active', 'trial')
+        return sub.status in ('active', 'trialing')
     
     class Meta:
         ordering = ['name']
@@ -53,6 +80,8 @@ class User(AbstractUser):
     email = None
     username = None
     phone = models.CharField(max_length=10, unique=True)
+    google_sub = models.CharField(max_length=128, unique=True, null=True, blank=True)
+    google_email = models.CharField(max_length=255, unique=True, null=True, blank=True)
     phone_verified = models.BooleanField(default=False)
     cafe_manager = models.BooleanField(default=False)  # Legacy field, kept for backward compatibility
     order_count = models.IntegerField(default=0)
@@ -74,7 +103,13 @@ class User(AbstractUser):
     
     def is_restaurant_admin(self):
         """Check if user is a restaurant admin"""
-        return self.role == 'restaurant_admin' or self.cafe_manager or (self.restaurant and self.role in ['restaurant_admin', 'super_admin'])
+        return bool(
+            self.is_superuser
+            or self.is_super_admin
+            or self.role in ['restaurant_admin', 'super_admin']
+            or self.cafe_manager
+            or (self.restaurant and self.role in ['restaurant_admin', 'super_admin'])
+        )
     
     def is_hr_manager(self):
         """Check if user is an HR manager"""
@@ -87,7 +122,7 @@ class User(AbstractUser):
     def has_permission(self, permission_name):
         """Check if user has a specific permission"""
         # Super admin has all permissions
-        if self.is_super_admin or self.role == 'super_admin':
+        if self.is_superuser or self.is_super_admin or self.role == 'super_admin':
             return True
         
         # Restaurant admin has all restaurant permissions
@@ -116,6 +151,139 @@ class User(AbstractUser):
                 return True
         
         return False
+
+
+class SubscriptionPlan(models.Model):
+    BILLING_CYCLE_CHOICES = [
+        ('monthly', 'Monthly'),
+        ('yearly', 'Yearly'),
+    ]
+
+    code = models.SlugField(max_length=40, unique=True)
+    name = models.CharField(max_length=120)
+    billing_cycle = models.CharField(max_length=20, choices=BILLING_CYCLE_CHOICES, default='monthly')
+    price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    currency = models.CharField(max_length=10, default='INR')
+    max_staff = models.IntegerField(default=20)
+    max_monthly_orders = models.IntegerField(default=1000)
+    max_tables = models.IntegerField(default=50)
+    modules = models.JSONField(default=dict, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
+class RestaurantSubscription(models.Model):
+    STATUS_CHOICES = [
+        ('trialing', 'Trialing'),
+        ('active', 'Active'),
+        ('pending_payment', 'Pending Payment'),
+        ('failed', 'Failed'),
+        ('past_due', 'Past Due'),
+        ('suspended', 'Suspended'),
+        ('cancelled', 'Cancelled'),
+    ]
+
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='subscriptions')
+    plan = models.ForeignKey(SubscriptionPlan, on_delete=models.PROTECT, related_name='subscriptions')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='trialing')
+    trial_ends_at = models.DateTimeField(null=True, blank=True)
+    current_period_start = models.DateTimeField(null=True, blank=True)
+    current_period_end = models.DateTimeField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.restaurant.name} - {self.plan.name} ({self.status})"
+
+
+class TenantUsageSnapshot(models.Model):
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='usage_snapshots')
+    month_key = models.CharField(max_length=7, help_text='YYYY-MM')
+    orders_count = models.IntegerField(default=0)
+    active_staff_count = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [['restaurant', 'month_key']]
+        ordering = ['-month_key']
+
+
+class BillingInvoice(models.Model):
+    STATUS_CHOICES = [
+        ('pending_payment', 'Pending Payment'),
+        ('paid', 'Paid'),
+        ('failed', 'Failed'),
+        ('void', 'Void'),
+    ]
+
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='billing_invoices')
+    subscription = models.ForeignKey(
+        RestaurantSubscription,
+        on_delete=models.SET_NULL,
+        related_name='billing_invoices',
+        null=True,
+        blank=True,
+    )
+    plan = models.ForeignKey(SubscriptionPlan, on_delete=models.PROTECT, related_name='billing_invoices')
+    invoice_number = models.CharField(max_length=40, unique=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(max_length=10, default='INR')
+    due_date = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending_payment')
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class BillingTransaction(models.Model):
+    STATUS_CHOICES = [
+        ('initiated', 'Initiated'),
+        ('success', 'Success'),
+        ('failed', 'Failed'),
+    ]
+
+    invoice = models.ForeignKey(BillingInvoice, on_delete=models.CASCADE, related_name='transactions')
+    gateway = models.CharField(max_length=20, default='esewa')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='initiated')
+    gateway_reference = models.CharField(max_length=120, blank=True, null=True)
+    request_payload = models.JSONField(default=dict, blank=True)
+    response_payload = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class PlatformAuditLog(models.Model):
+    actor = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='platform_audit_logs')
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.SET_NULL, null=True, blank=True, related_name='platform_audit_logs')
+    action = models.CharField(max_length=80)
+    target_type = models.CharField(max_length=40, blank=True, default='')
+    target_id = models.CharField(max_length=50, blank=True, default='')
+    before_state = models.JSONField(default=dict, blank=True)
+    after_state = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
 
 
 class Permission(models.Model):
@@ -460,9 +628,42 @@ class order(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
-    
+    placed_by = models.CharField(
+        max_length=20,
+        choices=[('customer', 'Customer'), ('waiter', 'Waiter')],
+        default='customer',
+    )
+    placed_by_staff = models.ForeignKey(
+        'Staff',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='orders_placed',
+    )
+    assigned_runner = models.ForeignKey(
+        'Staff',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='orders_assigned_to_deliver',
+    )
+    assigned_at = models.DateTimeField(null=True, blank=True)
+    kitchen_notes = models.TextField(blank=True, null=True)
+    stock_consumed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text='When BOM stock was deducted for this order (idempotency).',
+    )
+
     class Meta:
         ordering = ['-created_at']
+        permissions = [
+            ('can_place_waiter_order', 'Can place orders as waiter from tables'),
+            ('can_view_kitchen_queue', 'Can view kitchen order queue for restaurant'),
+            ('can_update_order_status_kitchen', 'Can advance order status as kitchen'),
+            ('can_update_order_status_runner', 'Can advance order status as runner or waiter'),
+            ('can_assign_runner', 'Can assign waiter to deliver prepared food'),
+        ]
     
     def __str__(self):
         restaurant_name = self.restaurant.name if self.restaurant else 'No Restaurant'
@@ -504,6 +705,12 @@ class bill(models.Model):
     payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='unpaid')
     payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES, default='unknown')
     tip_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    class Meta:
+        permissions = [
+            ('can_mark_paid', 'Can mark bills and orders as paid'),
+            ('can_create_bill', 'Can create or regenerate bills'),
+        ]
 
     def __str__(self):
         restaurant_name = self.restaurant.name if self.restaurant else 'No Restaurant'
@@ -600,6 +807,13 @@ class Staff(models.Model):
         ('other', 'Other'),
     ]
 
+    OPERATIONAL_ACCESS_CHOICES = [
+        ('auto', 'From role title (waiter/chef keywords)'),
+        ('waiter', 'Take orders & tables (waiter)'),
+        ('kitchen_chef', 'Kitchen queue'),
+        ('none', 'No waiter/kitchen portal access'),
+    ]
+
     id = models.AutoField(primary_key=True)
     restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='staff_members', null=True, blank=True)
     employee_id = models.CharField(max_length=20)
@@ -619,6 +833,12 @@ class Staff(models.Model):
     salary = models.DecimalField(max_digits=10, decimal_places=2)
     employment_status = models.CharField(max_length=20, choices=EMPLOYMENT_STATUS_CHOICES, default='active')
     is_active = models.BooleanField(default=True)
+    operational_access = models.CharField(
+        max_length=20,
+        choices=OPERATIONAL_ACCESS_CHOICES,
+        default='auto',
+        help_text='Controls waiter/kitchen Django groups for the staff portal (manage-staff).',
+    )
     profile_picture = models.ImageField(upload_to='staff_profiles/', blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -1003,3 +1223,168 @@ class TrainingEnrollment(models.Model):
 
     def __str__(self):
         return f"{self.employee.full_name} - {self.training.title}"
+
+
+# --- Inventory (restaurant-scoped) ---
+
+
+class Supplier(models.Model):
+    restaurant = models.ForeignKey(
+        Restaurant, on_delete=models.CASCADE, related_name='suppliers', null=True, blank=True
+    )
+    name = models.CharField(max_length=200)
+    phone = models.CharField(max_length=30, blank=True)
+    email = models.EmailField(blank=True)
+    address = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['restaurant', 'name']
+        unique_together = [['restaurant', 'name']]
+
+    def __str__(self):
+        return self.name
+
+
+class Ingredient(models.Model):
+    restaurant = models.ForeignKey(
+        Restaurant, on_delete=models.CASCADE, related_name='ingredients', null=True, blank=True
+    )
+    name = models.CharField(max_length=200)
+    sku = models.CharField(max_length=80, blank=True)
+    unit = models.CharField(max_length=30, default='unit', help_text='e.g. kg, L, piece')
+    reorder_level = models.DecimalField(max_digits=14, decimal_places=4, default=0)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['restaurant', 'name']
+        unique_together = [['restaurant', 'name']]
+        permissions = [
+            ('can_manage_inventory', 'Manage ingredients, recipes, and stock adjustments'),
+            ('can_view_inventory', 'View ingredients and stock levels'),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class IngredientStock(models.Model):
+    ingredient = models.OneToOneField(
+        Ingredient, on_delete=models.CASCADE, related_name='stock_level'
+    )
+    quantity_on_hand = models.DecimalField(max_digits=14, decimal_places=4, default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.ingredient.name}: {self.quantity_on_hand}"
+
+
+class MenuItemRecipe(models.Model):
+    menu_item = models.ForeignKey(menu_item, on_delete=models.CASCADE, related_name='recipe_lines')
+    ingredient = models.ForeignKey(Ingredient, on_delete=models.CASCADE, related_name='recipe_usages')
+    quantity = models.DecimalField(
+        max_digits=14,
+        decimal_places=4,
+        help_text='Ingredient amount consumed per 1 unit of menu item sold',
+    )
+
+    class Meta:
+        unique_together = [['menu_item', 'ingredient']]
+
+    def __str__(self):
+        return f"{self.menu_item.name} ← {self.ingredient.name}"
+
+
+class StockMovement(models.Model):
+    MOVEMENT_PURCHASE = 'purchase'
+    MOVEMENT_ADJUSTMENT = 'adjustment'
+    MOVEMENT_CONSUMPTION = 'consumption'
+    MOVEMENT_REVERSAL = 'reversal'
+    MOVEMENT_WASTE = 'waste'
+    MOVEMENT_TYPES = [
+        (MOVEMENT_PURCHASE, 'Purchase / receive'),
+        (MOVEMENT_ADJUSTMENT, 'Manual adjustment'),
+        (MOVEMENT_CONSUMPTION, 'Order consumption'),
+        (MOVEMENT_REVERSAL, 'Reversal (e.g. cancelled order)'),
+        (MOVEMENT_WASTE, 'Waste / spoilage'),
+    ]
+
+    restaurant = models.ForeignKey(
+        Restaurant, on_delete=models.CASCADE, related_name='stock_movements', null=True, blank=True
+    )
+    ingredient = models.ForeignKey(Ingredient, on_delete=models.CASCADE, related_name='movements')
+    quantity_delta = models.DecimalField(
+        max_digits=14,
+        decimal_places=4,
+        help_text='Positive adds stock, negative removes',
+    )
+    movement_type = models.CharField(max_length=20, choices=MOVEMENT_TYPES)
+    order_ref = models.ForeignKey(
+        order, on_delete=models.SET_NULL, null=True, blank=True, related_name='stock_movements'
+    )
+    purchase_order_line = models.ForeignKey(
+        'PurchaseOrderLine', on_delete=models.SET_NULL, null=True, blank=True, related_name='movements'
+    )
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.movement_type} {self.ingredient_id} {self.quantity_delta}"
+
+
+class PurchaseOrder(models.Model):
+    STATUS_DRAFT = 'draft'
+    STATUS_ORDERED = 'ordered'
+    STATUS_PARTIAL = 'partially_received'
+    STATUS_RECEIVED = 'received'
+    STATUS_CANCELLED = 'cancelled'
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, 'Draft'),
+        (STATUS_ORDERED, 'Ordered'),
+        (STATUS_PARTIAL, 'Partially received'),
+        (STATUS_RECEIVED, 'Received'),
+        (STATUS_CANCELLED, 'Cancelled'),
+    ]
+
+    restaurant = models.ForeignKey(
+        Restaurant, on_delete=models.CASCADE, related_name='purchase_orders', null=True, blank=True
+    )
+    supplier = models.ForeignKey(Supplier, on_delete=models.PROTECT, related_name='purchase_orders')
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    reference = models.CharField(max_length=80, blank=True)
+    expected_date = models.DateField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        permissions = [
+            ('can_manage_purchase_order', 'Create and edit purchase orders'),
+            ('can_receive_purchase_order', 'Receive purchase orders into stock'),
+        ]
+
+    def __str__(self):
+        return f"PO-{self.id} ({self.get_status_display()})"
+
+
+class PurchaseOrderLine(models.Model):
+    purchase_order = models.ForeignKey(PurchaseOrder, on_delete=models.CASCADE, related_name='lines')
+    ingredient = models.ForeignKey(Ingredient, on_delete=models.PROTECT, related_name='po_lines')
+    quantity_ordered = models.DecimalField(max_digits=14, decimal_places=4)
+    quantity_received = models.DecimalField(max_digits=14, decimal_places=4, default=0)
+    unit_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    class Meta:
+        ordering = ['id']
+
+    def __str__(self):
+        return f"PO{self.purchase_order_id} {self.ingredient.name}"

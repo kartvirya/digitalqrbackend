@@ -76,11 +76,13 @@ MIDDLEWARE = [
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'cafe.middleware.RestaurantContextMiddleware',  # Add restaurant context middleware
+    'cafe.middleware.TenantSubscriptionGuardMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
 # CORS settings for React frontend - dynamic
+CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -111,6 +113,8 @@ CORS_ALLOW_HEADERS = [
     'x-requested-with',
     'x-restaurant-id',
     'x-restaurant-slug',
+    'x-table-unique-id',
+    'x-room-unique-id',
 ]
 
 # Authentication backends

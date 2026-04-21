@@ -4,4 +4,5 @@ django-cors-headers
 Pillow
 qrcode
 django-filter
+requests
 

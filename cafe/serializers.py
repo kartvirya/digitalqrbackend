@@ -1,5 +1,43 @@
 from rest_framework import serializers
-from .models import Restaurant, User, Table, Floor, Room, menu_item, order, rating, bill, Payment, Department, Role, Staff, Attendance, Leave, HRDepartment, HRPosition, Employee, EmployeeDocument, Payroll, LeaveRequest, PerformanceReview, Training, TrainingEnrollment
+from .models import (
+    Restaurant,
+    User,
+    Table,
+    Floor,
+    Room,
+    menu_item,
+    order,
+    rating,
+    bill,
+    Payment,
+    Department,
+    Role,
+    Staff,
+    Attendance,
+    Leave,
+    HRDepartment,
+    HRPosition,
+    Employee,
+    EmployeeDocument,
+    Payroll,
+    LeaveRequest,
+    PerformanceReview,
+    Training,
+    TrainingEnrollment,
+    Supplier,
+    Ingredient,
+    IngredientStock,
+    MenuItemRecipe,
+    StockMovement,
+    PurchaseOrder,
+    PurchaseOrderLine,
+    SubscriptionPlan,
+    RestaurantSubscription,
+    TenantUsageSnapshot,
+    BillingInvoice,
+    BillingTransaction,
+    PlatformAuditLog,
+)
 import json
 
 
@@ -11,7 +49,7 @@ class RestaurantSerializer(serializers.ModelSerializer):
         model = Restaurant
         fields = [
             'id', 'name', 'slug', 'address', 'phone', 'email',
-            'is_active', 'subscription_status', 'settings',
+            'is_active', 'subscription_status', 'lifecycle_status', 'archived_at', 'terminated_at', 'settings',
             'created_at', 'updated_at', 'stats'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -45,15 +83,23 @@ class UserSerializer(serializers.ModelSerializer):
     staff_profile = serializers.SerializerMethodField()
     restaurant = RestaurantSerializer(read_only=True)
     restaurant_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
-    
+    django_groups = serializers.SerializerMethodField()
+    django_permissions = serializers.SerializerMethodField()
+
     class Meta:
         model = User
         fields = [
             'id', 'first_name', 'last_name', 'phone', 'cafe_manager',
             'is_superuser', 'is_super_admin', 'order_count', 'staff_profile',
-            'restaurant', 'restaurant_id'
+            'restaurant', 'restaurant_id', 'django_groups', 'django_permissions',
         ]
         read_only_fields = ['id', 'order_count']
+
+    def get_django_groups(self, obj):
+        return list(obj.groups.order_by('name').values_list('name', flat=True))
+
+    def get_django_permissions(self, obj):
+        return sorted(obj.get_all_permissions())
     
     def get_staff_profile(self, obj):
         try:
@@ -75,7 +121,10 @@ class UserSerializer(serializers.ModelSerializer):
                     },
                     'hire_date': staff.hire_date,
                     'salary': staff.salary,
-                    'employment_status': staff.employment_status
+                    'employment_status': staff.employment_status,
+                    'django_groups': list(
+                        staff.user.groups.order_by('name').values_list('name', flat=True)
+                    ),
                 }
             return None
         except:
@@ -177,7 +226,9 @@ class OrderSerializer(serializers.ModelSerializer):
     order_type = serializers.CharField(read_only=True)
     payment_status = serializers.CharField(read_only=True)
     payment_method = serializers.CharField(read_only=True)
-    
+    placed_by_staff_name = serializers.SerializerMethodField()
+    assigned_runner_name = serializers.SerializerMethodField()
+
     class Meta:
         model = order
         fields = [
@@ -200,8 +251,26 @@ class OrderSerializer(serializers.ModelSerializer):
             'room_unique_id',
             'order_type',
             'invoice_number',
+            'placed_by',
+            'placed_by_staff',
+            'placed_by_staff_name',
+            'assigned_runner',
+            'assigned_runner_name',
+            'assigned_at',
+            'kitchen_notes',
+            'stock_consumed_at',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_placed_by_staff_name(self, obj):
+        if obj.placed_by_staff_id:
+            return obj.placed_by_staff.full_name
+        return None
+
+    def get_assigned_runner_name(self, obj):
+        if obj.assigned_runner_id:
+            return obj.assigned_runner.full_name
+        return None
 
 
 class RatingSerializer(serializers.ModelSerializer):
@@ -308,7 +377,7 @@ class StaffSerializer(serializers.ModelSerializer):
             'id', 'employee_id', 'user', 'first_name', 'last_name', 'full_name', 'email', 'phone',
             'date_of_birth', 'gender', 'address', 'emergency_contact_name', 'emergency_contact_phone',
             'department', 'department_name', 'role', 'role_name', 'hire_date', 'salary',
-            'employment_status', 'is_active', 'profile_picture', 'profile_picture_url',
+            'employment_status', 'is_active', 'operational_access', 'profile_picture', 'profile_picture_url',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -326,30 +395,37 @@ class StaffCreateSerializer(serializers.ModelSerializer):
         fields = [
             'employee_id', 'first_name', 'last_name', 'email', 'phone', 'date_of_birth',
             'gender', 'address', 'emergency_contact_name', 'emergency_contact_phone',
-            'department', 'role', 'hire_date', 'salary', 'user_data'
+            'department', 'role', 'hire_date', 'salary', 'operational_access', 'user_data'
         ]
 
     def create(self, validated_data):
         user_data = validated_data.pop('user_data')
-        
-        # Create user account (User model only has phone field)
+
         user = User.objects.create_user(
             phone=user_data['phone'],
-            password=user_data['password']
+            password=user_data['password'],
         )
-        
-        # Create staff profile
+        user.role = 'staff'
+        user.first_name = validated_data.get('first_name', '')
+        user.last_name = validated_data.get('last_name', '')
+        user.save(update_fields=['role', 'first_name', 'last_name'])
+
         staff = Staff.objects.create(user=user, **validated_data)
+        if staff.restaurant_id:
+            user.restaurant = staff.restaurant
+            user.save(update_fields=['restaurant'])
         return staff
 
 class AttendanceSerializer(serializers.ModelSerializer):
     staff_name = serializers.CharField(source='staff.full_name', read_only=True)
     staff_employee_id = serializers.CharField(source='staff.employee_id', read_only=True)
+    employee_name = serializers.CharField(source='employee.full_name', read_only=True)
 
     class Meta:
         model = Attendance
         fields = [
-            'id', 'staff', 'staff_name', 'staff_employee_id', 'date', 'check_in_time',
+            'id', 'staff', 'staff_name', 'staff_employee_id', 'employee', 'employee_name',
+            'date', 'check_in_time',
             'check_out_time', 'status', 'notes', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -558,3 +634,163 @@ class TrainingEnrollmentSerializer(serializers.ModelSerializer):
         if obj.certificate_file:
             return self.context['request'].build_absolute_uri(obj.certificate_file.url)
         return None
+
+
+class SupplierSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Supplier
+        fields = [
+            'id', 'restaurant', 'name', 'phone', 'email', 'address',
+            'is_active', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class IngredientStockSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = IngredientStock
+        fields = ['id', 'ingredient', 'quantity_on_hand', 'updated_at']
+        read_only_fields = ['id', 'updated_at']
+
+
+class IngredientSerializer(serializers.ModelSerializer):
+    quantity_on_hand = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Ingredient
+        fields = [
+            'id', 'restaurant', 'name', 'sku', 'unit', 'reorder_level',
+            'is_active', 'quantity_on_hand', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_quantity_on_hand(self, obj):
+        try:
+            return obj.stock_level.quantity_on_hand
+        except IngredientStock.DoesNotExist:
+            return None
+
+
+class MenuItemRecipeSerializer(serializers.ModelSerializer):
+    ingredient_name = serializers.CharField(source='ingredient.name', read_only=True)
+    menu_item_name = serializers.CharField(source='menu_item.name', read_only=True)
+
+    class Meta:
+        model = MenuItemRecipe
+        fields = [
+            'id', 'menu_item', 'menu_item_name', 'ingredient', 'ingredient_name', 'quantity',
+        ]
+        read_only_fields = ['id']
+
+
+class StockMovementSerializer(serializers.ModelSerializer):
+    ingredient_name = serializers.CharField(source='ingredient.name', read_only=True)
+
+    class Meta:
+        model = StockMovement
+        fields = [
+            'id', 'restaurant', 'ingredient', 'ingredient_name', 'quantity_delta',
+            'movement_type', 'order_ref', 'purchase_order_line', 'notes',
+            'created_at', 'created_by',
+        ]
+        read_only_fields = ['id', 'created_at']
+
+
+class PurchaseOrderLineSerializer(serializers.ModelSerializer):
+    ingredient_name = serializers.CharField(source='ingredient.name', read_only=True)
+
+    class Meta:
+        model = PurchaseOrderLine
+        fields = [
+            'id', 'purchase_order', 'ingredient', 'ingredient_name',
+            'quantity_ordered', 'quantity_received', 'unit_cost',
+        ]
+        read_only_fields = ['id']
+
+
+class PurchaseOrderSerializer(serializers.ModelSerializer):
+    lines = PurchaseOrderLineSerializer(many=True, read_only=True)
+    supplier_name = serializers.CharField(source='supplier.name', read_only=True)
+
+    class Meta:
+        model = PurchaseOrder
+        fields = [
+            'id', 'restaurant', 'supplier', 'supplier_name', 'status', 'reference',
+            'expected_date', 'notes', 'lines', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class SubscriptionPlanSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SubscriptionPlan
+        fields = [
+            'id', 'code', 'name', 'billing_cycle', 'price', 'currency',
+            'max_staff', 'max_monthly_orders', 'max_tables', 'modules', 'is_active',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class RestaurantSubscriptionSerializer(serializers.ModelSerializer):
+    plan_name = serializers.CharField(source='plan.name', read_only=True)
+    plan_code = serializers.CharField(source='plan.code', read_only=True)
+    plan_modules = serializers.JSONField(source='plan.modules', read_only=True)
+
+    class Meta:
+        model = RestaurantSubscription
+        fields = [
+            'id', 'restaurant', 'plan', 'plan_name', 'plan_code', 'plan_modules',
+            'status', 'trial_ends_at', 'current_period_start', 'current_period_end',
+            'is_active', 'metadata', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class TenantUsageSnapshotSerializer(serializers.ModelSerializer):
+    restaurant_name = serializers.CharField(source='restaurant.name', read_only=True)
+
+    class Meta:
+        model = TenantUsageSnapshot
+        fields = [
+            'id', 'restaurant', 'restaurant_name', 'month_key',
+            'orders_count', 'active_staff_count', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class BillingInvoiceSerializer(serializers.ModelSerializer):
+    restaurant_name = serializers.CharField(source='restaurant.name', read_only=True)
+    plan_name = serializers.CharField(source='plan.name', read_only=True)
+
+    class Meta:
+        model = BillingInvoice
+        fields = [
+            'id', 'restaurant', 'restaurant_name', 'subscription', 'plan', 'plan_name',
+            'invoice_number', 'amount', 'currency', 'due_date', 'status', 'metadata',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'invoice_number', 'created_at', 'updated_at']
+
+
+class BillingTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BillingTransaction
+        fields = [
+            'id', 'invoice', 'gateway', 'status', 'gateway_reference',
+            'request_payload', 'response_payload', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class PlatformAuditLogSerializer(serializers.ModelSerializer):
+    actor_phone = serializers.CharField(source='actor.phone', read_only=True)
+    restaurant_name = serializers.CharField(source='restaurant.name', read_only=True)
+
+    class Meta:
+        model = PlatformAuditLog
+        fields = [
+            'id', 'actor', 'actor_phone', 'restaurant', 'restaurant_name', 'action',
+            'target_type', 'target_id', 'before_state', 'after_state', 'metadata', 'created_at',
+        ]
+        read_only_fields = ['id', 'created_at']
