@@ -137,7 +137,7 @@ class RestaurantViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
     
     def get_permissions(self):
-        if self.action in ['list', 'retrieve', 'public_landing']:
+        if self.action in ['list', 'retrieve', 'public_landing', 'by_slug']:
             return [permissions.AllowAny()]  # Allow viewing restaurants
         return [permissions.IsAuthenticated()]
 
@@ -366,6 +366,20 @@ class RestaurantViewSet(viewsets.ModelViewSet):
         current['restaurant_name'] = restaurant.name
         return Response(current)
     
+    @action(detail=False, methods=['get'], url_path='by-slug/(?P<slug>[^/.]+)')
+    def by_slug(self, request, slug=None):
+        """Get restaurant by slug - public endpoint for customer-facing routes"""
+        if not slug:
+            return Response({'error': 'slug is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            restaurant = Restaurant.objects.get(slug=slug, is_active=True)
+        except Restaurant.DoesNotExist:
+            return Response({'error': 'Restaurant not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = self.get_serializer(restaurant)
+        return Response(serializer.data)
+
     @action(detail=True, methods=['post'])
     def activate(self, request, pk=None):
         """Activate or deactivate a restaurant"""
@@ -3063,6 +3077,40 @@ class RolePermissionViewSet(viewsets.ModelViewSet):
 class UserRoleViewSet(viewsets.ViewSet):
     """ViewSet for managing user roles"""
     permission_classes = [IsSuperAdmin]
+
+    @action(detail=False, methods=['get'])
+    def roles(self, request):
+        role_catalog = []
+        role_keys = [choice[0] for choice in User.ROLE_CHOICES]
+        for role in role_keys:
+            role_catalog.append(
+                {
+                    'role': role,
+                    'effective_role': User.ROLE_ALIAS_MAP.get(role, role),
+                    'legacy': role in dict(User.LEGACY_ROLE_CHOICES),
+                    'label': dict(User.ROLE_CHOICES).get(role, role),
+                }
+            )
+        return Response(role_catalog)
+
+    @action(detail=False, methods=['get'])
+    def role_permissions(self, request):
+        rows = []
+        for role in [choice[0] for choice in User.ROLE_CHOICES]:
+            codenames = list(
+                RolePermission.objects.filter(role=role)
+                .select_related('permission')
+                .order_by('permission__category', 'permission__codename')
+                .values_list('permission__codename', flat=True)
+            )
+            rows.append(
+                {
+                    'role': role,
+                    'effective_role': User.ROLE_ALIAS_MAP.get(role, role),
+                    'permission_codenames': codenames,
+                }
+            )
+        return Response(rows)
     
     @action(detail=False, methods=['get'])
     def users_by_role(self, request):
@@ -3080,6 +3128,7 @@ class UserRoleViewSet(viewsets.ViewSet):
         try:
             user = User.objects.get(pk=pk)
             new_role = request.data.get('role')
+            sync_flags = str(request.data.get('sync_flags', 'true')).lower() in {'1', 'true', 'yes', 'on'}
             
             if not new_role:
                 return Response({'error': 'role is required'}, status=status.HTTP_400_BAD_REQUEST)
@@ -3088,6 +3137,21 @@ class UserRoleViewSet(viewsets.ViewSet):
                 return Response({'error': 'Invalid role'}, status=status.HTTP_400_BAD_REQUEST)
             
             user.role = new_role
+
+            if sync_flags:
+                effective_role = user.get_effective_role()
+                # Keep explicit super admin role synchronized.
+                if new_role == 'super_admin':
+                    user.is_super_admin = True
+                    user.is_staff = True
+                    user.cafe_manager = True
+                # Tenant owner/admin should be operational admins.
+                if effective_role in {'owner', 'admin'}:
+                    user.is_staff = True
+                    user.cafe_manager = True
+                elif effective_role in {'maintain', 'write', 'triage'}:
+                    user.is_staff = True
+
             user.save()
             
             serializer = UserSerializer(user)

@@ -17,6 +17,17 @@ def env_list(name, default=""):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def env(name, default=""):
+    return os.environ.get(name, default)
+
+
+def env_int(name, default=0):
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
 def build_database_config():
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not database_url:
@@ -48,7 +59,12 @@ SECRET_KEY = os.environ.get(
     "django-insecure-^#ku(-=1nwd8wnfe&1eri+k)_(8g@!n*#p3&!i4=!!c)&rhl3v",
 )
 
-DEBUG = env_bool("DJANGO_DEBUG", False)
+raw_debug = os.environ.get("DJANGO_DEBUG")
+if raw_debug is None:
+    # Local default: if DATABASE_URL is missing, assume dev mode.
+    DEBUG = not bool(os.environ.get("DATABASE_URL", "").strip())
+else:
+    DEBUG = raw_debug.strip().lower() in {"1", "true", "yes", "on"}
 USE_TZ = env_bool("DJANGO_USE_TZ", False)
 
 def get_local_ip():
@@ -68,6 +84,7 @@ SOCKET_SERVER_URL = os.environ.get("SOCKET_SERVER_URL", "http://127.0.0.1:8001")
 default_allowed_hosts = [
     "localhost",
     "127.0.0.1",
+    get_local_ip(),
 ]
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", ",".join(default_allowed_hosts)) or default_allowed_hosts
 
@@ -83,18 +100,22 @@ INSTALLED_APPS = [
     'corsheaders',
     'cafe',
     'django_filters',
+    'whitenoise',
+    'social_django',  # For Google OAuth
 ]
 
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
-    'cafe.middleware.CsrfExemptMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
-    'cafe.middleware.RestaurantContextMiddleware',  # Add restaurant context middleware
     'cafe.middleware.TenantSubscriptionGuardMiddleware',
+    'cafe.middleware.RateLimitMiddleware',  # Rate limiting middleware
+    'cafe.middleware.SecurityHeadersMiddleware',  # Security headers middleware
+    'cafe.utils.audit_logging.AuditLoggingMiddleware',  # Audit logging middleware
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -210,7 +231,7 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 LANGUAGE_CODE = 'en-us'
-TIME_ZONE = os.environ.get('DJANGO_TIME_ZONE', 'UTC')
+TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = env_bool('DJANGO_USE_TZ', True)
 
@@ -240,5 +261,39 @@ SECURE_HSTS_SECONDS = int(os.environ.get('SECURE_HSTS_SECONDS', '3600' if not DE
 SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool('SECURE_HSTS_INCLUDE_SUBDOMAINS', not DEBUG)
 SECURE_HSTS_PRELOAD = env_bool('SECURE_HSTS_PRELOAD', False)
 SECURE_REFERRER_POLICY = os.environ.get('SECURE_REFERRER_POLICY', 'same-origin')
+
+# Google OAuth Configuration
+GOOGLE_OAUTH2_CLIENT_ID = env('GOOGLE_OAUTH2_CLIENT_ID', '')
+GOOGLE_OAUTH2_CLIENT_SECRET = env('GOOGLE_OAUTH2_CLIENT_SECRET', '')
+
+# Social Auth Configuration
+AUTHENTICATION_BACKENDS = [
+    'social_core.backends.google.GoogleOAuth2',
+    'django.contrib.auth.backends.ModelBackend',
+]
+
+SOCIAL_AUTH_GOOGLE_OAUTH2_KEY = GOOGLE_OAUTH2_CLIENT_ID
+SOCIAL_AUTH_GOOGLE_OAUTH2_SECRET = GOOGLE_OAUTH2_CLIENT_SECRET
+SOCIAL_AUTH_GOOGLE_OAUTH2_SCOPE = [
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/userinfo.profile',
+]
+
+# Social Auth Pipeline
+SOCIAL_AUTH_PIPELINE = (
+    'social_core.pipeline.social_auth.social_details',
+    'social_core.pipeline.social_auth.social_uid',
+    'social_core.pipeline.social_auth.auth_allowed',
+    'social_core.pipeline.social_auth.social_user',
+    'social_core.pipeline.user.get_username',
+    'cafe.social_auth.create_user_from_google',
+    'social_core.pipeline.social_auth.associate_user',
+    'social_core.pipeline.social_auth.load_extra_data',
+    'cafe.social_auth.create_trial_subscription',
+    'social_core.pipeline.user.user_details',
+)
+
+# Trial Configuration
+TRIAL_PERIOD_DAYS = env_int('TRIAL_PERIOD_DAYS', 7)
 
 STATICFILES_STORAGE = 'django.contrib.staticfiles.storage.StaticFilesStorage'

@@ -1,0 +1,1 @@
+"""Cafe Django application package."""

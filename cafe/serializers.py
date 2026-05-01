@@ -85,15 +85,19 @@ class UserSerializer(serializers.ModelSerializer):
     restaurant_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
     django_groups = serializers.SerializerMethodField()
     django_permissions = serializers.SerializerMethodField()
+    effective_role = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = [
-            'id', 'first_name', 'last_name', 'phone', 'cafe_manager',
+            'id', 'first_name', 'last_name', 'phone', 'role', 'effective_role', 'cafe_manager',
             'is_superuser', 'is_super_admin', 'order_count', 'staff_profile',
             'restaurant', 'restaurant_id', 'django_groups', 'django_permissions',
         ]
         read_only_fields = ['id', 'order_count']
+
+    def get_effective_role(self, obj):
+        return obj.get_effective_role()
 
     def get_django_groups(self, obj):
         return list(obj.groups.order_by('name').values_list('name', flat=True))

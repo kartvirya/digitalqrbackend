@@ -1,13 +1,17 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser
-from .manager import UserManager
+from django.core.exceptions import ValidationError
+from django.utils import timezone
+from django.db.models import Sum, Count, Avg, F, Q
+from decimal import Decimal
+import uuid
 import qrcode
 from io import BytesIO
-from django.core.files import File
-from django.core.files.base import ContentFile
 from PIL import Image
-import uuid
+from django.core.files.base import ContentFile
+from django.contrib.contenttypes.models import ContentType
 import json
+from .manager import UserManager
 # Create your models here.
 
 
@@ -47,6 +51,29 @@ class Restaurant(models.Model):
     def __str__(self):
         return self.name
 
+    def clean(self):
+        """Validate restaurant slug against reserved words"""
+        super().clean()
+        if self.slug:
+            self.validate_slug(self.slug)
+
+    @staticmethod
+    def validate_slug(slug):
+        """Validate that slug is not a reserved word"""
+        RESERVED_SLUGS = {
+            'login', 'dashboard', 'profile', 'super-admin-panel',
+            'manage-menu', 'order-management', 'manage-tables', 
+            'manage-floors', 'manage-staff', 'manage-inventory', 
+            'manage-rooms', 'manage-orders', 'manage-website',
+            'admin-hr', 'billing', 'staff-portal', 'kot-login',
+            'cart', 'my-orders', 'reviews', 'order-tracking',
+            'table-orders', 'bills', '404', 'api', 'admin',
+            'signup', 'r', 'assets', 'static', 'media'
+        }
+        
+        if slug.lower() in RESERVED_SLUGS:
+            raise ValidationError(f'"{slug}" is a reserved name and cannot be used as a restaurant slug.')
+
     @property
     def active_subscription(self):
         return self.subscriptions.filter(is_active=True).order_by('-created_at').first()
@@ -69,25 +96,38 @@ class Restaurant(models.Model):
 
 
 class User(AbstractUser):
-    ROLE_CHOICES = [
+    # GitHub-style role set (new)
+    GITHUB_ROLE_CHOICES = [
+        ('owner', 'Owner (full control)'),
+        ('admin', 'Admin (manage all restaurant resources)'),
+        ('maintain', 'Maintain (manage operations and teams)'),
+        ('write', 'Write (create/update day-to-day resources)'),
+        ('triage', 'Triage (review and moderate operations)'),
+        ('read', 'Read (view-only)'),
+    ]
+
+    # Legacy role set (kept for backward compatibility)
+    LEGACY_ROLE_CHOICES = [
         ('super_admin', 'Super Admin'),
         ('restaurant_admin', 'Restaurant Admin'),
-        ('hr_manager', 'HR Manager'),
-        ('staff', 'Staff'),
+        ('restaurant_staff', 'Restaurant Staff'),
         ('customer', 'Customer'),
     ]
 
-    email = None
-    username = None
-    phone = models.CharField(max_length=10, unique=True)
-    google_sub = models.CharField(max_length=128, unique=True, null=True, blank=True)
-    google_email = models.CharField(max_length=255, unique=True, null=True, blank=True)
-    phone_verified = models.BooleanField(default=False)
-    cafe_manager = models.BooleanField(default=False)  # Legacy field, kept for backward compatibility
+    ROLE_CHOICES = GITHUB_ROLE_CHOICES + LEGACY_ROLE_CHOICES
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    email = models.EmailField(unique=True)
+    phone = models.CharField(max_length=20, unique=True, blank=True, null=True)
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='customer', help_text="User role in the system")
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.SET_NULL, null=True, blank=True, related_name='admins', help_text="Restaurant this user manages (for restaurant admins)")
+    is_verified = models.BooleanField(default=False, help_text="Whether the user has verified their email")
+    google_email = models.CharField(max_length=255, blank=True, null=True, unique=True, help_text="Google OAuth email")
+    google_sub = models.CharField(max_length=128, blank=True, null=True, unique=True, help_text="Google OAuth subject ID")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)  
     order_count = models.IntegerField(default=0)
     is_super_admin = models.BooleanField(default=False, help_text="Super admin can manage all restaurants")
-    restaurant = models.ForeignKey(Restaurant, on_delete=models.SET_NULL, null=True, blank=True, related_name='admins', help_text="Restaurant this user manages (for restaurant admins)")
-    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='customer', help_text="User role in the system")
 
     objects = UserManager()
 
@@ -103,52 +143,98 @@ class User(AbstractUser):
     
     def is_restaurant_admin(self):
         """Check if user is a restaurant admin"""
+        effective_role = self.get_effective_role()
         return bool(
             self.is_superuser
             or self.is_super_admin
+            or effective_role in ['owner', 'admin']
             or self.role in ['restaurant_admin', 'super_admin']
             or self.cafe_manager
-            or (self.restaurant and self.role in ['restaurant_admin', 'super_admin'])
+            or (self.restaurant and effective_role in ['owner', 'admin'])
         )
+
+    def get_effective_role(self):
+        """Normalize legacy roles to GitHub-style role names."""
+        return self.ROLE_ALIAS_MAP.get(self.role, self.role)
+
+    def get_role_candidates(self):
+        """Return all role keys that should be considered for permission lookup."""
+        effective = self.get_effective_role()
+        roles = {self.role, effective}
+        for legacy, normalized in self.ROLE_ALIAS_MAP.items():
+            if normalized == effective:
+                roles.add(legacy)
+        return list(roles)
     
     def is_hr_manager(self):
         """Check if user is an HR manager"""
-        return self.role == 'hr_manager' or (self.is_restaurant_admin() and self.role == 'hr_manager')
+        effective_role = self.get_effective_role()
+        return bool(
+            self.role == 'hr_manager'
+            or effective_role in ['maintain', 'admin', 'owner']
+            or (self.is_restaurant_admin() and self.role == 'hr_manager')
+        )
     
     def is_staff_member(self):
         """Check if user is a staff member"""
-        return self.role == 'staff' or hasattr(self, 'employee_profile')
+        return (
+            self.get_effective_role() in ['write', 'triage', 'maintain']
+            or self.role == 'staff'
+            or hasattr(self, 'employee_profile')
+        )
     
     def has_permission(self, permission_name):
         """Check if user has a specific permission"""
+        permission_name = str(permission_name or '').strip()
+        if not permission_name:
+            return False
+
         # Super admin has all permissions
         if self.is_superuser or self.is_super_admin or self.role == 'super_admin':
             return True
-        
-        # Restaurant admin has all restaurant permissions
-        if self.is_restaurant_admin():
-            restaurant_permissions = [
+
+        # Owner has full tenant-level control.
+        if self.get_effective_role() == 'owner':
+            return True
+
+        # First check Django model permissions namespace.
+        if self.has_perm(f'cafe.{permission_name}') or self.has_perm(permission_name):
+            return True
+
+        # Then check custom role-permission assignments.
+        role_candidates = self.get_role_candidates()
+        if RolePermission.objects.filter(
+            role__in=role_candidates,
+            permission__codename=permission_name,
+        ).exists():
+            return True
+
+        # Safe fallbacks so existing behavior keeps working when role seeds are missing.
+        fallback_permissions = {
+            'admin': {
                 'manage_menu', 'manage_tables', 'manage_rooms', 'manage_floors',
                 'manage_orders', 'manage_staff', 'manage_employees', 'manage_payroll',
-                'manage_attendance', 'manage_leaves', 'manage_training', 'manage_performance'
-            ]
-            if permission_name in restaurant_permissions:
-                return True
-        
-        # HR Manager has HR permissions
-        if self.is_hr_manager():
-            hr_permissions = [
-                'manage_employees', 'manage_payroll', 'manage_attendance',
-                'manage_leaves', 'manage_training', 'manage_performance'
-            ]
-            if permission_name in hr_permissions:
-                return True
-        
-        # Staff has operations permissions
-        if self.is_staff_member():
-            staff_permissions = ['manage_orders', 'view_tables', 'view_kitchen']
-            if permission_name in staff_permissions:
-                return True
+                'manage_attendance', 'manage_leaves', 'manage_training', 'manage_performance',
+            },
+            'maintain': {
+                'manage_orders', 'manage_staff', 'manage_employees', 'manage_payroll',
+                'manage_attendance', 'manage_leaves', 'manage_training', 'manage_performance',
+                'manage_menu', 'manage_tables', 'manage_rooms', 'manage_floors',
+            },
+            'write': {
+                'manage_orders',
+            },
+            'triage': {
+                'view_orders', 'view_employees', 'view_payroll', 'view_attendance',
+                'view_leaves', 'view_training', 'view_performance',
+            },
+            'read': {
+                'view_orders',
+            },
+        }
+        effective = self.get_effective_role()
+        if permission_name in fallback_permissions.get(effective, set()):
+            return True
         
         return False
 
@@ -300,6 +386,11 @@ class Permission(models.Model):
         ('training', 'Training Management'),
         ('performance', 'Performance Management'),
         ('hr', 'HR Management'),
+        ('inventory', 'Inventory Management'),
+        ('billing', 'Billing and Subscription'),
+        ('reports', 'Reports and Analytics'),
+        ('settings', 'Settings and Configuration'),
+        ('security', 'Security and Access'),
     ]
     
     name = models.CharField(max_length=100, unique=True)
@@ -320,6 +411,12 @@ class Permission(models.Model):
 class RolePermission(models.Model):
     """Many-to-many relationship between roles and permissions"""
     ROLE_CHOICES = [
+        ('owner', 'Owner (full control)'),
+        ('admin', 'Admin'),
+        ('maintain', 'Maintain'),
+        ('write', 'Write'),
+        ('triage', 'Triage'),
+        ('read', 'Read'),
         ('super_admin', 'Super Admin'),
         ('restaurant_admin', 'Restaurant Admin'),
         ('hr_manager', 'HR Manager'),
@@ -416,9 +513,9 @@ class Table(models.Model):
                 box_size=10,
                 border=4,
             )
-            # URL for table-specific ordering - using restaurant slug
+            # URL for table-specific ordering - using restaurant slug in new format
             from django.conf import settings
-            url = f"{settings.FRONTEND_URL}/r/{self.restaurant.slug}/?table={self.qr_unique_id}"
+            url = f"{settings.FRONTEND_URL}/{self.restaurant.slug}/?table={self.qr_unique_id}"
             qr.add_data(url)
             qr.make(fit=True)
             
@@ -516,9 +613,9 @@ class Room(models.Model):
                 box_size=10,
                 border=4,
             )
-            # URL for room-specific ordering - using restaurant slug
+            # URL for room-specific ordering - using restaurant slug in new format
             from django.conf import settings
-            url = f"{settings.FRONTEND_URL}/r/{self.restaurant.slug}/?room={self.qr_unique_id}"
+            url = f"{settings.FRONTEND_URL}/{self.restaurant.slug}/?room={self.qr_unique_id}"
             qr.add_data(url)
             qr.make(fit=True)
             
@@ -1388,3 +1485,414 @@ class PurchaseOrderLine(models.Model):
 
     def __str__(self):
         return f"PO{self.purchase_order_id} {self.ingredient.name}"
+
+
+# --- Accounting Module (Nepal Compliant) ---
+
+
+class ChartOfAccounts(models.Model):
+    """Chart of accounts for double-entry bookkeeping (Nepal restaurant standard)"""
+    ACCOUNT_TYPES = [
+        ('asset', 'Asset'),
+        ('liability', 'Liability'),
+        ('equity', 'Equity'),
+        ('revenue', 'Revenue'),
+        ('expense', 'Expense'),
+    ]
+    
+    # Standard Nepal restaurant account codes
+    STANDARD_ACCOUNTS = {
+        '1000': ('Cash / eSewa / Khalti', 'asset'),
+        '1100': ('Accounts Receivable', 'asset'),
+        '1200': ('Inventory', 'asset'),
+        '2000': ('Accounts Payable', 'liability'),
+        '2100': ('VAT Payable (13%)', 'liability'),
+        '2200': ('TDS Payable', 'liability'),
+        '2300': ('SSF Payable', 'liability'),
+        '3000': ("Owner's Equity", 'equity'),
+        '4000': ('Food Sales', 'revenue'),
+        '4100': ('Beverage Sales', 'revenue'),
+        '5000': ('Cost of Goods Sold', 'expense'),
+        '5100': ('Salaries & Wages', 'expense'),
+        '5200': ('Rent', 'expense'),
+    }
+    
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='chart_of_accounts', null=True, blank=True)
+    code = models.CharField(max_length=10, help_text="Account code (e.g., 1000, 2100)")
+    name = models.CharField(max_length=200)
+    account_type = models.CharField(max_length=20, choices=ACCOUNT_TYPES)
+    parent_account = models.ForeignKey('self', on_delete=models.CASCADE, null=True, blank=True, related_name='sub_accounts')
+    is_active = models.BooleanField(default=True)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['restaurant', 'code']
+        unique_together = [['restaurant', 'code']]
+        verbose_name = 'Chart of Accounts'
+        verbose_name_plural = 'Chart of Accounts'
+    
+    def __str__(self):
+        restaurant_name = self.restaurant.name if self.restaurant else 'System'
+        return f"{restaurant_name} - {self.code} {self.name}"
+
+
+class JournalEntry(models.Model):
+    """Journal entries for double-entry bookkeeping"""
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='journal_entries', null=True, blank=True)
+    entry_number = models.CharField(max_length=50, unique=True, help_text="Sequential journal entry number")
+    date = models.DateField(help_text="Transaction date")
+    description = models.CharField(max_length=500)
+    reference_type = models.CharField(max_length=50, blank=True, help_text="e.g., order, bill, purchase_order")
+    reference_id = models.CharField(max_length=50, blank=True, null=True)
+    total_debit = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    total_credit = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    is_posted = models.BooleanField(default=False, help_text="Whether entry is posted to ledger")
+    posted_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['-date', '-created_at']
+        unique_together = [['restaurant', 'entry_number']]
+    
+    def __str__(self):
+        restaurant_name = self.restaurant.name if self.restaurant else 'System'
+        return f"{restaurant_name} - Journal {self.entry_number} - {self.date}"
+    
+    def save(self, *args, **kwargs):
+        if not self.entry_number:
+            # Generate sequential entry number
+            last_entry = JournalEntry.objects.filter(
+                restaurant=self.restaurant
+            ).order_by('-entry_number').first()
+            
+            if last_entry and last_entry.entry_number.isdigit():
+                next_number = int(last_entry.entry_number) + 1
+            else:
+                next_number = 1
+            
+            self.entry_number = str(next_number).zfill(6)
+        
+        super().save(*args, **kwargs)
+
+
+class JournalEntryLine(models.Model):
+    """Individual line items for journal entries"""
+    journal_entry = models.ForeignKey(JournalEntry, on_delete=models.CASCADE, related_name='lines')
+    account = models.ForeignKey(ChartOfAccounts, on_delete=models.CASCADE, related_name='journal_lines')
+    description = models.CharField(max_length=200, blank=True)
+    debit_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    credit_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    
+    class Meta:
+        ordering = ['id']
+    
+    def __str__(self):
+        return f"{self.journal_entry.entry_number} - {self.account.name} - D:{self.debit_amount} C:{self.credit_amount}"
+
+
+class TaxConfiguration(models.Model):
+    """Tax configuration for Nepal compliance"""
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='tax_configurations', null=True, blank=True)
+    tax_type = models.CharField(max_length=50, choices=[
+        ('vat', 'VAT (13%)'),
+        ('tds_goods', 'TDS on Goods (1.5%)'),
+        ('tds_services', 'TDS on Services (15%)'),
+        ('ssf_employer', 'SSF Employer (20%)'),
+        ('ssf_employee', 'SSF Employee (11%)'),
+        ('service_charge', 'Service Charge (10%)'),
+        ('tourism_tax', 'Tourism Service Tax'),
+    ])
+    rate_percentage = models.DecimalField(max_digits=5, decimal_places=2, help_text="Tax rate in percentage")
+    is_active = models.BooleanField(default=True)
+    effective_date = models.DateField()
+    expiry_date = models.DateField(null=True, blank=True)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['restaurant', 'tax_type', '-effective_date']
+        unique_together = [['restaurant', 'tax_type', 'effective_date']]
+    
+    def __str__(self):
+        restaurant_name = self.restaurant.name if self.restaurant else 'System'
+        return f"{restaurant_name} - {self.get_tax_type_display()} - {self.rate_percentage}%"
+
+
+class FiscalYear(models.Model):
+    """Fiscal year management for Nepal (Shrawan to Ashadh)"""
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='fiscal_years', null=True, blank=True)
+    year_bs = models.CharField(max_length=10, help_text="Fiscal year in Bikram Sambat (e.g., 2081/82)")
+    year_ad = models.CharField(max_length=9, help_text="Fiscal year in AD (e.g., 2024/25)")
+    start_date_bs = models.DateField(help_text="Start date in Bikram Sambat")
+    end_date_bs = models.DateField(help_text="End date in Bikram Sambat")
+    start_date_ad = models.DateField(help_text="Start date in AD")
+    end_date_ad = models.DateField(help_text="End date in AD")
+    is_active = models.BooleanField(default=True)
+    is_closed = models.BooleanField(default=False, help_text="Whether fiscal year is closed")
+    closed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['-year_bs']
+        unique_together = [['restaurant', 'year_bs']]
+    
+    def __str__(self):
+        restaurant_name = self.restaurant.name if self.restaurant else 'System'
+        return f"{restaurant_name} - FY {self.year_bs} ({self.year_ad})"
+
+
+class AccountingPeriod(models.Model):
+    """Accounting periods within fiscal year"""
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='accounting_periods', null=True, blank=True)
+    fiscal_year = models.ForeignKey(FiscalYear, on_delete=models.CASCADE, related_name='periods')
+    period_name = models.CharField(max_length=50, help_text="e.g., Shrawan, Bhadra, etc.")
+    period_number = models.IntegerField(help_text="1-12 for months")
+    start_date = models.DateField()
+    end_date = models.DateField()
+    is_closed = models.BooleanField(default=False)
+    closed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['fiscal_year', 'period_number']
+        unique_together = [['restaurant', 'fiscal_year', 'period_number']]
+    
+    def __str__(self):
+        restaurant_name = self.restaurant.name if self.restaurant else 'System'
+        return f"{restaurant_name} - {self.fiscal_year.year_bs} - {self.period_name}"
+
+
+# --- IRD Integration Models ---
+
+
+class IRDSubmission(models.Model):
+    """Track IRD CBM bill submissions"""
+    STATUS_CHOICES = [
+        ('pending', 'Pending Submission'),
+        ('submitted', 'Submitted to IRD'),
+        ('accepted', 'Accepted by IRD'),
+        ('rejected', 'Rejected by IRD'),
+        ('voided', 'Voided in IRD'),
+    ]
+    
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='ird_submissions', null=True, blank=True)
+    bill = models.OneToOneField(bill, on_delete=models.CASCADE, related_name='ird_submission')
+    ird_bill_id = models.CharField(max_length=100, unique=True, help_text="IRD bill identifier")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    submission_data = models.JSONField(default=dict, help_text="Data submitted to IRD")
+    ird_response = models.JSONField(default=dict, help_text="Response from IRD")
+    qr_code = models.TextField(blank=True, help_text="IRD QR code for verification")
+    verification_url = models.URLField(blank=True, help_text="IRD verification URL")
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'IRD Submission'
+        verbose_name_plural = 'IRD Submissions'
+    
+    def __str__(self):
+        restaurant_name = self.restaurant.name if self.restaurant else 'System'
+        return f"{restaurant_name} - IRD {self.ird_bill_id} - {self.get_status_display()}"
+
+
+class IRDConfiguration(models.Model):
+    """IRD configuration for restaurants"""
+    restaurant = models.OneToOneField(Restaurant, on_delete=models.CASCADE, related_name='ird_config')
+    pan_number = models.CharField(max_length=20, help_text="Restaurant PAN number")
+    api_token = models.CharField(max_length=500, help_text="IRD API token")
+    software_registration_id = models.CharField(max_length=100, help_text="IRD software registration ID")
+    is_enabled = models.BooleanField(default=False, help_text="Enable IRD integration")
+    auto_submit_bills = models.BooleanField(default=True, help_text="Automatically submit bills to IRD")
+    test_mode = models.BooleanField(default=True, help_text="Use IRD test environment")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    sync_status = models.CharField(max_length=50, default='not_synced')
+    configuration_data = models.JSONField(default=dict, help_text="Additional IRD configuration")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = 'IRD Configuration'
+        verbose_name_plural = 'IRD Configurations'
+    
+    def __str__(self):
+        restaurant_name = self.restaurant.name if self.restaurant else 'System'
+        return f"{restaurant_name} - IRD Config ({'Enabled' if self.is_enabled else 'Disabled'})"
+
+
+class IRDSyncLog(models.Model):
+    """Log IRD synchronization attempts"""
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='ird_sync_logs', null=True, blank=True)
+    sync_type = models.CharField(max_length=50, choices=[
+        ('bill_submission', 'Bill Submission'),
+        ('bill_void', 'Bill Void'),
+        ('status_check', 'Status Check'),
+        ('configuration_sync', 'Configuration Sync'),
+    ])
+    status = models.CharField(max_length=20, choices=[
+        ('success', 'Success'),
+        ('error', 'Error'),
+        ('pending', 'Pending'),
+    ])
+    request_data = models.JSONField(default=dict, help_text="Data sent to IRD")
+    response_data = models.JSONField(default=dict, help_text="Response from IRD")
+    error_message = models.TextField(blank=True)
+    duration_ms = models.IntegerField(null=True, blank=True, help_text="Request duration in milliseconds")
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'IRD Sync Log'
+        verbose_name_plural = 'IRD Sync Logs'
+    
+    def __str__(self):
+        restaurant_name = self.restaurant.name if self.restaurant else 'System'
+        return f"{restaurant_name} - {self.get_sync_type_display()} - {self.get_status_display()}"
+
+
+class IRDVatReturn(models.Model):
+    """Track VAT return periods and submissions"""
+    RETURN_PERIODS = [
+        ('monthly', 'Monthly'),
+        ('quarterly', 'Quarterly'),
+    ]
+    
+    STATUS_CHOICES = [
+        ('draft', 'Draft'),
+        ('submitted', 'Submitted'),
+        ('accepted', 'Accepted'),
+        ('rejected', 'Rejected'),
+        ('amended', 'Amended'),
+    ]
+    
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='ird_vat_returns', null=True, blank=True)
+    return_period = models.CharField(max_length=20, choices=RETURN_PERIODS)
+    fiscal_year = models.CharField(max_length=10, help_text="e.g., 2081/82")
+    start_date = models.DateField()
+    end_date = models.DateField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
+    
+    # VAT amounts
+    total_sales = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    total_vat_collected = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    total_purchases = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    total_vat_paid = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    net_vat_payable = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    
+    # IRD submission details
+    ird_return_id = models.CharField(max_length=100, blank=True, null=True)
+    submission_data = models.JSONField(default=dict, help_text="Data submitted to IRD")
+    ird_response = models.JSONField(default=dict, help_text="Response from IRD")
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-fiscal_year', '-start_date']
+        unique_together = [['restaurant', 'return_period', 'fiscal_year', 'start_date']]
+        verbose_name = 'IRD VAT Return'
+        verbose_name_plural = 'IRD VAT Returns'
+    
+    def __str__(self):
+        restaurant_name = self.restaurant.name if self.restaurant else 'System'
+        return f"{restaurant_name} - VAT Return {self.fiscal_year} {self.get_return_period_display()}"
+
+
+class IRDTdsReturn(models.Model):
+    """Track TDS (Tax Deducted at Source) returns"""
+    TDS_TYPES = [
+        ('goods', 'TDS on Goods (1.5%)'),
+        ('services', 'TDS on Services (15%)'),
+        ('salary', 'TDS on Salary'),
+        ('other', 'Other TDS'),
+    ]
+    
+    STATUS_CHOICES = [
+        ('draft', 'Draft'),
+        ('submitted', 'Submitted'),
+        ('accepted', 'Accepted'),
+        ('rejected', 'Rejected'),
+    ]
+    
+    restaurant = models.ForeignKey(Restaurant, on_delete=models.CASCADE, related_name='ird_tds_returns', null=True, blank=True)
+    tds_type = models.CharField(max_length=20, choices=TDS_TYPES)
+    fiscal_year = models.CharField(max_length=10, help_text="e.g., 2081/82")
+    return_month = models.IntegerField(help_text="Month number (1-12)")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
+    
+    # TDS amounts
+    total_payments = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    total_tds_deducted = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    number_of_deductees = models.IntegerField(default=0)
+    
+    # IRD submission details
+    ird_return_id = models.CharField(max_length=100, blank=True, null=True)
+    submission_data = models.JSONField(default=dict, help_text="Data submitted to IRD")
+    ird_response = models.JSONField(default=dict, help_text="Response from IRD")
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-fiscal_year', '-return_month']
+        unique_together = [['restaurant', 'tds_type', 'fiscal_year', 'return_month']]
+        verbose_name = 'IRD TDS Return'
+        verbose_name_plural = 'IRD TDS Returns'
+    
+    def __str__(self):
+        restaurant_name = self.restaurant.name if self.restaurant else 'System'
+        return f"{restaurant_name} - {self.get_tds_type_display()} {self.fiscal_year} {self.return_month}"
+
+
+class AuditLog(models.Model):
+    """Audit log model for tracking sensitive operations"""
+    
+    ACTION_TYPES = [
+        ('CREATE', 'Create'),
+        ('UPDATE', 'Update'),
+        ('DELETE', 'Delete'),
+        ('LOGIN', 'Login'),
+        ('LOGOUT', 'Logout'),
+        ('LOGIN_FAILED', 'Login Failed'),
+        ('PASSWORD_CHANGE', 'Password Change'),
+        ('PERMISSION_CHANGE', 'Permission Change'),
+        ('API_ACCESS', 'API Access'),
+        ('DATA_EXPORT', 'Data Export'),
+        ('SYSTEM_CONFIG', 'System Configuration'),
+        ('SECURITY_EVENT', 'Security Event'),
+    ]
+    
+    user = models.ForeignKey('User', on_delete=models.SET_NULL, null=True, blank=True)
+    action_type = models.CharField(max_length=20, choices=ACTION_TYPES)
+    action_description = models.TextField()
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(blank=True)
+    timestamp = models.DateTimeField(default=timezone.now)
+    object_type = models.CharField(max_length=100, blank=True)
+    object_id = models.CharField(max_length=100, blank=True)
+    object_repr = models.CharField(max_length=200, blank=True)
+    changes = models.JSONField(default=dict, blank=True)
+    additional_data = models.JSONField(default=dict, blank=True)
+    
+    class Meta:
+        ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['user', 'timestamp']),
+            models.Index(fields=['action_type', 'timestamp']),
+            models.Index(fields=['ip_address', 'timestamp']),
+        ]
+    
+    def __str__(self):
+        return f"{self.action_type} - {self.user} - {self.timestamp}"

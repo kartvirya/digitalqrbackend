@@ -171,7 +171,11 @@ class IsSuperAdmin(permissions.BasePermission):
         return (
             request.user and
             request.user.is_authenticated and
-            (request.user.is_super_admin or request.user.role == 'super_admin')
+            (
+                request.user.is_superuser
+                or request.user.is_super_admin
+                or request.user.role == 'super_admin'
+            )
         )
 
 
