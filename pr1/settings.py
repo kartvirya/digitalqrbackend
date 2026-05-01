@@ -165,6 +165,7 @@ CORS_ALLOW_HEADERS = [
 
 AUTHENTICATION_BACKENDS = [
     'cafe.backends.PhoneBackend',
+    'social_core.backends.google.GoogleOAuth2',
     'django.contrib.auth.backends.ModelBackend',
 ]
 
@@ -267,11 +268,6 @@ GOOGLE_OAUTH2_CLIENT_ID = env('GOOGLE_OAUTH2_CLIENT_ID', '')
 GOOGLE_OAUTH2_CLIENT_SECRET = env('GOOGLE_OAUTH2_CLIENT_SECRET', '')
 
 # Social Auth Configuration
-AUTHENTICATION_BACKENDS = [
-    'social_core.backends.google.GoogleOAuth2',
-    'django.contrib.auth.backends.ModelBackend',
-]
-
 SOCIAL_AUTH_GOOGLE_OAUTH2_KEY = GOOGLE_OAUTH2_CLIENT_ID
 SOCIAL_AUTH_GOOGLE_OAUTH2_SECRET = GOOGLE_OAUTH2_CLIENT_SECRET
 SOCIAL_AUTH_GOOGLE_OAUTH2_SCOPE = [
