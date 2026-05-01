@@ -6,6 +6,7 @@ qrcode
 django-filter
 requests
 gunicorn
+whitenoise
 Flask
 python-socketio
 eventlet
