@@ -116,7 +116,8 @@ class User(AbstractUser):
 
     ROLE_CHOICES = GITHUB_ROLE_CHOICES + LEGACY_ROLE_CHOICES
 
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)  # Temporarily using AutoField
+    id = models.AutoField(primary_key=True)
     email = models.EmailField(unique=True)
     phone = models.CharField(max_length=20, unique=True, blank=True, null=True)
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='customer', help_text="User role in the system")
@@ -127,7 +128,16 @@ class User(AbstractUser):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)  
     order_count = models.IntegerField(default=0)
+    cafe_manager = models.BooleanField(default=False)
     is_super_admin = models.BooleanField(default=False, help_text="Super admin can manage all restaurants")
+
+    # Role mapping for legacy to GitHub-style roles
+    ROLE_ALIAS_MAP = {
+        'super_admin': 'owner',
+        'restaurant_admin': 'admin', 
+        'restaurant_staff': 'write',
+        'customer': 'read',
+    }
 
     objects = UserManager()
 
