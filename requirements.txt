@@ -7,6 +7,7 @@ django-filter
 requests
 gunicorn
 whitenoise
+social-auth-app-django
 Flask
 python-socketio
 eventlet
