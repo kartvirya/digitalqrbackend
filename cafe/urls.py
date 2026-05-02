@@ -56,8 +56,8 @@ router.register(r'api/inventory/movements', StockMovementViewSet, basename='inve
 router.register(r'api/inventory/purchase-orders', PurchaseOrderViewSet, basename='inventory-purchase-orders')
 
 urlpatterns = [
-    # API endpoints
-    path('api/', include(router.urls)),
+    # API endpoints (router registers with api/ prefix, included at root)
+    path('', include(router.urls)),
     
     # Additional API endpoints
     path('api/order-status/<int:order_id>/', views.api_order_status, name='api_order_status'),
