@@ -116,6 +116,7 @@ class User(AbstractUser):
 
     ROLE_CHOICES = GITHUB_ROLE_CHOICES + LEGACY_ROLE_CHOICES
 
+    username = None  # Remove username field inherited from AbstractUser (not used)
     # id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)  # Temporarily using AutoField
     id = models.AutoField(primary_key=True)
     email = models.EmailField(unique=True)
