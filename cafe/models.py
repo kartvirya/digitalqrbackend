@@ -110,24 +110,21 @@ class User(AbstractUser):
     LEGACY_ROLE_CHOICES = [
         ('super_admin', 'Super Admin'),
         ('restaurant_admin', 'Restaurant Admin'),
-        ('restaurant_staff', 'Restaurant Staff'),
+        ('hr_manager', 'HR Manager'),
+        ('staff', 'Staff'),
         ('customer', 'Customer'),
     ]
 
     ROLE_CHOICES = GITHUB_ROLE_CHOICES + LEGACY_ROLE_CHOICES
 
-    username = None  # Remove username field inherited from AbstractUser (not used)
-    # id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)  # Temporarily using AutoField
-    id = models.AutoField(primary_key=True)
-    email = models.EmailField(unique=True)
-    phone = models.CharField(max_length=20, unique=True, blank=True, null=True)
+    username = None
+    email = None
+    phone = models.CharField(max_length=10, unique=True)
+    phone_verified = models.BooleanField(default=False)
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='customer', help_text="User role in the system")
     restaurant = models.ForeignKey(Restaurant, on_delete=models.SET_NULL, null=True, blank=True, related_name='admins', help_text="Restaurant this user manages (for restaurant admins)")
-    is_verified = models.BooleanField(default=False, help_text="Whether the user has verified their email")
-    google_email = models.CharField(max_length=255, blank=True, null=True, unique=True, help_text="Google OAuth email")
-    google_sub = models.CharField(max_length=128, blank=True, null=True, unique=True, help_text="Google OAuth subject ID")
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)  
+    google_email = models.CharField(max_length=255, blank=True, null=True, unique=True)
+    google_sub = models.CharField(max_length=128, blank=True, null=True, unique=True)
     order_count = models.IntegerField(default=0)
     cafe_manager = models.BooleanField(default=False)
     is_super_admin = models.BooleanField(default=False, help_text="Super admin can manage all restaurants")
@@ -135,11 +132,11 @@ class User(AbstractUser):
     # Role mapping for legacy to GitHub-style roles
     ROLE_ALIAS_MAP = {
         'super_admin': 'owner',
-        'restaurant_admin': 'admin', 
-        'restaurant_staff': 'write',
+        'restaurant_admin': 'admin',
+        'hr_manager': 'maintain',
+        'staff': 'write',
         'customer': 'read',
     }
-
     objects = UserManager()
 
     USERNAME_FIELD = 'phone'
