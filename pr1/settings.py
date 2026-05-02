@@ -127,11 +127,14 @@ default_cors_origins = [
     "http://127.0.0.1:3001",
     "http://localhost:3002",
     "http://127.0.0.1:3002",
+    "http://localhost:3003",
+    "http://127.0.0.1:3003",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     f"http://{get_local_ip()}:3000",
     f"http://{get_local_ip()}:3001",
     f"http://{get_local_ip()}:3002",
+    f"http://{get_local_ip()}:3003",
     f"http://{get_local_ip()}:5173",
 ]
 
@@ -169,7 +172,10 @@ AUTHENTICATION_BACKENDS = [
     'django.contrib.auth.backends.ModelBackend',
 ]
 
-default_csrf_trusted_origins = list(dict.fromkeys(CORS_ALLOWED_ORIGINS))
+default_csrf_trusted_origins = list(dict.fromkeys(CORS_ALLOWED_ORIGINS + [
+    "http://localhost:3003",
+    "http://127.0.0.1:3003",
+]))
 CSRF_TRUSTED_ORIGINS = env_list(
     "CSRF_TRUSTED_ORIGINS",
     ",".join(default_csrf_trusted_origins),

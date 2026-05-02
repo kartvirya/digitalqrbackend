@@ -14,6 +14,8 @@ from rest_framework.permissions import IsAuthenticatedOrReadOnly
 from django.conf import settings
 from django.db import transaction
 from django.contrib.sessions.models import Session
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
 import os
 import sys
 import requests
@@ -137,7 +139,7 @@ class RestaurantViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
     
     def get_permissions(self):
-        if self.action in ['list', 'retrieve', 'public_landing', 'by_slug']:
+        if self.action in ['list', 'retrieve', 'public_landing']:
             return [permissions.AllowAny()]  # Allow viewing restaurants
         return [permissions.IsAuthenticated()]
 
@@ -366,20 +368,6 @@ class RestaurantViewSet(viewsets.ModelViewSet):
         current['restaurant_name'] = restaurant.name
         return Response(current)
     
-    @action(detail=False, methods=['get'], url_path='by-slug/(?P<slug>[^/.]+)')
-    def by_slug(self, request, slug=None):
-        """Get restaurant by slug - public endpoint for customer-facing routes"""
-        if not slug:
-            return Response({'error': 'slug is required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            restaurant = Restaurant.objects.get(slug=slug, is_active=True)
-        except Restaurant.DoesNotExist:
-            return Response({'error': 'Restaurant not found'}, status=status.HTTP_404_NOT_FOUND)
-
-        serializer = self.get_serializer(restaurant)
-        return Response(serializer.data)
-
     @action(detail=True, methods=['post'])
     def activate(self, request, pk=None):
         """Activate or deactivate a restaurant"""
@@ -1359,6 +1347,7 @@ class BillViewSet(viewsets.ReadOnlyModelViewSet):
         return queryset
 
 
+@method_decorator(csrf_exempt, name='dispatch')
 class AuthViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
